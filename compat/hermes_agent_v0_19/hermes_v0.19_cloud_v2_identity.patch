@@ -1,0 +1,54 @@
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -1853,3 +1853,5 @@
+             ("POST", "/api/mobile/pair", self._handle_mobile_pair),
++            ("GET", "/api/mobile/cloud/identity", self._handle_mobile_cloud_identity),
++            ("POST", "/api/mobile/cloud/configure", self._handle_mobile_cloud_configure),
+             ("DELETE", "/api/mobile/pair/device", self._handle_mobile_pair_device),
+             ("POST", "/api/mobile/cloud/binding", self._handle_mobile_cloud_binding),
+@@ -3278,0 +3278,44 @@
++
++    async def _handle_mobile_cloud_identity(self, request: "web.Request") -> "web.Response":
++        """GET /api/mobile/cloud/identity - return public Hermes Server identity only."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        try:
++            from hermes_link_server_identity import public_identity
++            return web.json_response(await asyncio.to_thread(public_identity))
++        except Exception:
++            logger.exception("Hermes Link Cloud identity unavailable")
++            return web.json_response(
++                _openai_error("Hermes Server Cloud identity is unavailable", code="cloud_identity_unavailable"),
++                status=503,
++            )
++
++    async def _handle_mobile_cloud_configure(self, request: "web.Request") -> "web.Response":
++        """POST /api/mobile/cloud/configure - store Cloud identifiers on Hermes Server."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        body, body_err = await self._read_json_body(request)
++        if body_err:
++            return body_err
++        try:
++            from hermes_link_server_identity import configure_cloud
++            result = await asyncio.to_thread(configure_cloud, body)
++            try:
++                import hermes_link_push
++                hermes_link_push.reset_cloud_client()
++            except Exception:
++                logger.warning("Hermes Link Cloud client reset failed", exc_info=True)
++            return web.json_response(result)
++        except ValueError as exc:
++            return web.json_response(
++                _openai_error("Cloud configuration is invalid", code="cloud_config_invalid"),
++                status=400,
++            )
++        except Exception:
++            logger.exception("Hermes Link Cloud configuration failed")
++            return web.json_response(
++                _openai_error("Hermes Server Cloud configuration is unavailable", code="cloud_config_unavailable"),
++                status=503,
++            )

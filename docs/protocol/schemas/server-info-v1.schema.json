@@ -1,0 +1,40 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:hermes-link:protocol:v1:server-info",
+  "title": "Hermes Link Server Info v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["serverVersion", "protocolVersion", "hermesVersion", "features"],
+  "properties": {
+    "serverVersion": {"type": "string", "minLength": 1},
+    "protocolVersion": {"const": 1},
+    "hermesVersion": {"type": "string", "minLength": 1},
+    "gateway_state": {"type": "string", "minLength": 1},
+    "active_agents": {"type": "integer", "minimum": 0},
+    "gateway_busy": {"type": "boolean"},
+    "features": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "chat",
+        "sessions",
+        "models",
+        "jobs",
+        "cron",
+        "pairing",
+        "directNotifications",
+        "cloudNotifications"
+      ],
+      "properties": {
+        "chat": {"type": "boolean"},
+        "sessions": {"type": "boolean"},
+        "models": {"type": "boolean"},
+        "jobs": {"type": "boolean"},
+        "cron": {"type": "boolean"},
+        "pairing": {"type": "boolean"},
+        "directNotifications": {"type": "boolean"},
+        "cloudNotifications": {"type": "boolean"}
+      }
+    }
+  }
+}

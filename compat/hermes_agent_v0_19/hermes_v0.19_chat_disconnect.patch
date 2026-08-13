@@ -1,0 +1,53 @@
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -4380,17 +4380,33 @@ class APIServerAdapter:
+         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+-            # Client disconnected mid-stream.  Interrupt the agent so it
+-            # stops making LLM API calls at the next loop iteration, then
+-            # cancel the asyncio task wrapper.
+-            agent = agent_ref[0] if agent_ref else None
+-            if agent is not None:
+-                try:
+-                    agent.interrupt("SSE client disconnected")
+-                except Exception:
+-                    pass
+-            if not agent_task.done():
+-                agent_task.cancel()
+-                try:
+-                    await agent_task
+-                except (asyncio.CancelledError, Exception):
+-                    pass
+-            logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
++            # A mobile client can lose its SSE socket when the device locks or
++            # the OS suspends the app. The Agent run is still user-requested:
++            # detach the stream, but let the run finish and enqueue Push.
++            async def _finish_disconnected_chat() -> None:
++                try:
++                    result, _usage = await agent_task
++                    completed = bool(result.get("completed", True)) if isinstance(result, dict) else True
++                    partial = bool(result.get("partial")) if isinstance(result, dict) else False
++                    failed = bool(result.get("failed")) if isinstance(result, dict) else False
++                    final_text = (
++                        str(result.get("final_response") or "").strip()
++                        if isinstance(result, dict) else ""
++                    )
++                    if completed and not partial and not failed and final_text:
++                        import hermes_link_push
++                        await asyncio.to_thread(
++                            hermes_link_push.publish_chat_completed,
++                            profile_id,
++                            str(result.get("session_id") or session_id),
++                            completion_id,
++                        )
++                except asyncio.CancelledError:
++                    raise
++                except Exception:
++                    logger.warning(
++                        "Hermes Link Push detached chat completion failed id=%s",
++                        completion_id,
++                        exc_info=True,
++                    )
++
++            asyncio.create_task(_finish_disconnected_chat())
++            logger.info("SSE client disconnected; detached agent task %s", completion_id)

@@ -1,0 +1,73 @@
+--- gateway/platforms/api_server.py
++++ gateway/platforms/api_server.py
+@@ -3011,6 +3011,7 @@
+             "output_tokens", "cache_read_tokens", "cache_write_tokens",
+             "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd",
+             "api_call_count", "parent_session_id", "last_active", "preview",
++            "archived",
+             "_lineage_root_id",
+         )
+         payload = {key: session.get(key) for key in safe_keys if key in session}
+@@ -3080,6 +3081,12 @@
+         offset = self._parse_nonnegative_int(request.query.get("offset"), default=0, maximum=1_000_000)
+         source = request.query.get("source") or None
+         include_children = _coerce_request_bool(request.query.get("include_children"), default=False)
++        archived = request.query.get("archived", "exclude")
++        if archived not in ("exclude", "only", "include"):
++            return web.json_response(
++                _openai_error("archived must be one of: exclude, only, include"),
++                status=400,
++            )
+         sessions = await asyncio.to_thread(db.list_sessions_rich,
+             source=source,
+             limit=limit,
+@@ -3087,5 +3094,7 @@
+             include_children=include_children,
+             order_by_last_active=True,
++            include_archived=archived == "include",
++            archived_only=archived == "only",
+         )
+         return web.json_response({
+             "object": "list",
+@@ -3229,7 +3238,7 @@
+         body, err = await self._read_json_body(request)
+         if err:
+             return err
+-        allowed = {"title", "end_reason"}
++        allowed = {"title", "end_reason", "archived"}
+         unknown = sorted(set(body) - allowed)
+         if unknown:
+             return web.json_response(_openai_error(f"Unsupported session fields: {', '.join(unknown)}", code="unsupported_session_field"), status=400)
+@@ -3241,5 +3250,12 @@
+             except ValueError as exc:
+                 return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
++        if "archived" in body:
++            archived = body["archived"]
++            if not isinstance(archived, bool):
++                return web.json_response(_openai_error("archived must be a boolean", code="invalid_archived"), status=400)
++            await asyncio.to_thread(db.set_session_archived, session_id, archived)
++            if not archived and session.get("end_reason") == "archived":
++                await asyncio.to_thread(db.reopen_session, session_id)
+         if body.get("end_reason"):
+             await asyncio.to_thread(db.end_session, session_id, str(body["end_reason"]))
+         session = await asyncio.to_thread(db.get_session, session_id) or session
+@@ -3268,11 +3283,18 @@
+             return err
+         db = await self._ensure_session_db_async()
+         resolved_id = await asyncio.to_thread(db.resolve_resume_session_id, session_id)
+-        messages = await asyncio.to_thread(db.get_messages, resolved_id)
++        limit = self._parse_nonnegative_int(request.query.get("limit"), default=200, maximum=500)
++        offset = self._parse_nonnegative_int(request.query.get("offset"), default=0, maximum=10_000_000)
++        messages = await asyncio.to_thread(
++            db.get_messages, resolved_id, False, limit, offset
++        )
+         return web.json_response({
+             "object": "list",
+             "session_id": resolved_id,
+             "data": [self._message_response(m) for m in messages],
++            "limit": limit,
++            "offset": offset,
++            "has_more": len(messages) == limit,
+         })
+ 
+     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":

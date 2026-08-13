@@ -1,0 +1,43 @@
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -1846,5 +1846,6 @@ class APIServerAdapter:
+             ("GET", "/api/mobile/notifications/stream", self._handle_mobile_notification_stream),
+             ("POST", "/api/mobile/chat/cancel", self._handle_mobile_chat_cancel),
++            ("POST", "/api/mobile/pair", self._handle_mobile_pair),
+             ("GET", "/api/jobs", self._handle_list_jobs),
+             ("POST", "/api/jobs", self._handle_create_job),
+             ("GET", "/api/jobs/{job_id}", self._handle_get_job),
+@@ -3181,2 +3181,30 @@ class APIServerAdapter:
+         return body, None
+
++    async def _handle_mobile_pair(self, request: "web.Request") -> "web.Response":
++        """POST /api/mobile/pair — exchange a one-time HTTPS pairing code."""
++        body, body_err = await self._read_json_body(request)
++        if body_err:
++            return body_err
++        if body.get("schema_version", 1) != 1:
++            return web.json_response(
++                _openai_error("Unsupported pairing schema", code="pairing_schema_unsupported"),
++                status=400,
++            )
++        code = body.get("code")
++        if not isinstance(code, str):
++            return web.json_response(
++                _openai_error("Pairing code is required", code="pairing_invalid"),
++                status=400,
++            )
++        try:
++            from hermes_link_pairing import PairingError, exchange_pairing_code
++            result = await asyncio.to_thread(exchange_pairing_code, code)
++        except PairingError as exc:
++            return web.json_response(_openai_error(str(exc), code=exc.code), status=exc.status)
++        except Exception:
++            logger.exception("Hermes Link pairing exchange failed")
++            return web.json_response(
++                _openai_error("Pairing service is unavailable", code="pairing_unavailable"),
++                status=503,
++            )
++        return web.json_response(result)
+
+     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":

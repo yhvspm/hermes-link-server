@@ -1,0 +1,23 @@
+[Unit]
+Description=Hermes Link Server
+After=network.target
+
+[Service]
+Type=simple
+User=hermes-link
+Group=hermes-link
+WorkingDirectory=/opt/hermes-link-server
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=-/etc/hermes-link-server/server.env
+EnvironmentFile=-/etc/hermes-link-server/internal-agent.env
+ExecStart=/opt/hermes-link-server/.venv/bin/python -m hermes_link.integrations.hermes_agent.bridge
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/hermes-link-server
+
+[Install]
+WantedBy=multi-user.target

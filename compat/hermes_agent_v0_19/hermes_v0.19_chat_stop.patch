@@ -1,0 +1,127 @@
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -1278,4 +1278,5 @@ class APIServerAdapter:
+         # drain between its first await and _run_agent()/task registration.
+         self._pending_agent_requests: int = 0
++        self._hermes_link_active_chats: Dict[str, Dict[str, Any]] = {}
+ 
+     def active_agent_work_count(self) -> int:
+@@ -1830,4 +1830,5 @@ class APIServerAdapter:
+             ("POST", "/api/mobile/push/devices", self._handle_push_device_register),
+             ("PATCH", "/api/mobile/push/devices/{installation_id}", self._handle_push_device_update),
+             ("DELETE", "/api/mobile/push/devices/{installation_id}", self._handle_push_device_delete),
++            ("POST", "/api/mobile/chat/cancel", self._handle_mobile_chat_cancel),
+             ("GET", "/api/jobs", self._handle_list_jobs),
+@@ -4061,1 +4061,16 @@ class APIServerAdapter:
+-            agent_task.add_done_callback(lambda _fut: _stream_q.put(None))
++            profile_id = (_api_request_profile.get() or "default")
++            chat_key = f"{profile_id}\x00{session_id}"
++            chat_state = {
++                "task": agent_task,
++                "agent_ref": agent_ref,
++                "stop_requested": False,
++            }
++            self._hermes_link_active_chats[chat_key] = chat_state
++
++            def _finish_hermes_link_chat(_fut):
++                _stream_q.put(None)
++                current = self._hermes_link_active_chats.get(chat_key)
++                if current is chat_state:
++                    self._hermes_link_active_chats.pop(chat_key, None)
++
++            agent_task.add_done_callback(_finish_hermes_link_chat)
+@@ -4067,4 +4081,4 @@ class APIServerAdapter:
+                 agent_task, agent_ref, session_id=session_id,
+                 gateway_session_key=gateway_session_key,
+-                profile_id=(_api_request_profile.get() or "default"),
++                profile_id=profile_id,
+             )
+@@ -4230,4 +4244,7 @@ class APIServerAdapter:
+         response = web.StreamResponse(status=200, headers=sse_headers)
+         await response.prepare(request)
++        hermes_link_chat_state = self._hermes_link_active_chats.get(
++            f"{profile_id}\x00{session_id}"
++        )
+ 
+         try:
+@@ -4398,3 +4415,6 @@ class APIServerAdapter:
+                 try:
+                     result, _usage = await agent_task
++                    if (hermes_link_chat_state is not None and
++                            hermes_link_chat_state.get("stop_requested")):
++                        return
+                     completed = bool(result.get("completed", True)) if isinstance(result, dict) else True
+@@ -4412,2 +4412,35 @@ class APIServerAdapter:
+             logger.info("SSE client disconnected; detached agent task %s", completion_id)
++        except asyncio.CancelledError:
++            async def _finish_cancelled_chat() -> None:
++                try:
++                    result, _usage = await agent_task
++                    if (hermes_link_chat_state is not None and
++                            hermes_link_chat_state.get("stop_requested")):
++                        return
++                    completed = bool(result.get("completed", True)) if isinstance(result, dict) else True
++                    partial = bool(result.get("partial")) if isinstance(result, dict) else False
++                    failed = bool(result.get("failed")) if isinstance(result, dict) else False
++                    final_text = (
++                        str(result.get("final_response") or "").strip()
++                        if isinstance(result, dict) else ""
++                    )
++                    if completed and not partial and not failed and final_text:
++                        import hermes_link_push
++                        await asyncio.to_thread(
++                            hermes_link_push.publish_chat_completed,
++                            profile_id,
++                            str(result.get("session_id") or session_id),
++                            completion_id,
++                        )
++                except asyncio.CancelledError:
++                    raise
++                except Exception:
++                    logger.warning(
++                        "Hermes Link Push cancelled chat completion failed id=%s",
++                        completion_id,
++                        exc_info=True,
++                    )
++            asyncio.create_task(_finish_cancelled_chat())
++            logger.info("SSE task cancelled; detached agent task %s", completion_id)
++            raise
+         except Exception as _exc:
+@@ -5280,4 +5331,35 @@ class APIServerAdapter:
+         return job_id, None
+ 
++    async def _handle_mobile_chat_cancel(self, request: "web.Request") -> "web.Response":
++        """POST /api/mobile/chat/cancel — stop one active mobile chat."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        body, body_err = await self._read_json_body(request)
++        if body_err:
++            return body_err
++        session_id = str(body.get("session_id") or "").strip() if isinstance(body, dict) else ""
++        if not session_id or len(session_id) > 256:
++            return web.json_response(
++                _openai_error("session_id is required", code="invalid_session_id"),
++                status=400,
++            )
++        profile_id = _api_request_profile.get() or "default"
++        chat_key = f"{profile_id}\x00{session_id}"
++        chat_state = self._hermes_link_active_chats.get(chat_key)
++        if chat_state is None:
++            return web.json_response({"ok": True, "cancelled": False, "reason": "not_found"})
++        chat_state["stop_requested"] = True
++        agent_ref = chat_state.get("agent_ref")
++        agent = agent_ref[0] if isinstance(agent_ref, list) and agent_ref else None
++        task = chat_state.get("task")
++        if agent is not None:
++            try:
++                agent.interrupt("Stop requested via Hermes Link")
++            except Exception:
++                logger.warning("Hermes Link mobile chat stop interrupt failed", exc_info=True)
++        elif task is not None and not task.done():
++            task.cancel()
++        return web.json_response({"ok": True, "cancelled": True})
+
+     async def _handle_list_jobs(self, request: "web.Request") -> "web.Response":
+         """GET /api/jobs — list all cron jobs."""

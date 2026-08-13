@@ -1,0 +1,18 @@
+{
+  "serverVersion": "1.0.0",
+  "protocolVersion": 1,
+  "hermesVersion": "0.20.0",
+  "gateway_state": "ready",
+  "active_agents": 0,
+  "gateway_busy": false,
+  "features": {
+    "chat": true,
+    "sessions": true,
+    "models": true,
+    "jobs": true,
+    "cron": true,
+    "pairing": true,
+    "directNotifications": true,
+    "cloudNotifications": true
+  }
+}

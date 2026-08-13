@@ -1,0 +1,371 @@
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -1488,19 +1488,22 @@ class APIServerAdapter:
+     def _cron_origin_from_request(self, request: "web.Request") -> Dict[str, str]:
+         """Persist safe API source metadata on cron jobs created over HTTP."""
+         ctx = self._request_audit_context(request)
+         origin = {
+             "platform": "api_server",
+             "chat_id": "api",
+         }
+         if ctx.get("remote"):
+             origin["source_ip"] = ctx["remote"]
+         if ctx.get("peer_ip"):
+             origin["peer_ip"] = ctx["peer_ip"]
+         if ctx.get("forwarded_for"):
+             origin["forwarded_for"] = ctx["forwarded_for"]
+         if ctx.get("real_ip"):
+             origin["real_ip"] = ctx["real_ip"]
+         if ctx.get("user_agent"):
+             origin["user_agent"] = ctx["user_agent"]
++        session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
++        if session_id and re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", session_id):
++            origin["session_id"] = session_id
+         return origin
+ 
+@@ -1829,5 +1829,8 @@ class APIServerAdapter:
+             # API_SERVER_KEY — external platforms hold no API server key.
+             ("POST", "/api/platforms/{platform}/events", self._handle_platform_event_callback),
++            ("POST", "/api/mobile/push/devices", self._handle_push_device_register),
++            ("PATCH", "/api/mobile/push/devices/{installation_id}", self._handle_push_device_update),
++            ("DELETE", "/api/mobile/push/devices/{installation_id}", self._handle_push_device_delete),
+             ("GET", "/api/jobs", self._handle_list_jobs),
+             ("POST", "/api/jobs", self._handle_create_job),
+             ("GET", "/api/jobs/{job_id}", self._handle_get_job),
+@@ -3939,3 +3942,4 @@ class APIServerAdapter:
+                 agent_task, agent_ref, session_id=session_id,
+                 gateway_session_key=gateway_session_key,
++                profile_id=(_api_request_profile.get() or "default"),
+             )
+@@ -4050,6 +4054,21 @@ class APIServerAdapter:
+             if err_msg:
+                 response_headers["X-Hermes-Error"] = _redact_api_error_text(err_msg, limit=200)
+ 
++        if final_response.strip() and completed and not is_failed and not is_partial:
++            try:
++                import hermes_link_push
++                await asyncio.to_thread(
++                    hermes_link_push.publish_chat_completed,
++                    _api_request_profile.get() or "default",
++                    str(result.get("session_id") or session_id),
++                    completion_id,
++                )
++            except Exception:
++                logger.warning(
++                    "[api_server] Hermes Link Push chat event enqueue failed",
++                    exc_info=True,
++                )
++
+         return web.json_response(response_data, headers=response_headers)
+ 
+     async def _write_sse_chat_completion(
+@@ -4057,3 +4076,4 @@ class APIServerAdapter:
+         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
+         gateway_session_key: str = None,
++        profile_id: str = "default",
+     ) -> "web.StreamResponse":
+@@ -4173,4 +4193,22 @@ class APIServerAdapter:
+                     "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
+                 }
++            final_text = (
++                str(result.get("final_response") or "").strip()
++                if isinstance(result, dict) else ""
++            )
++            if agent_error is None and completed and not is_failed and not is_partial and final_text:
++                try:
++                    import hermes_link_push
++                    await asyncio.to_thread(
++                        hermes_link_push.publish_chat_completed,
++                        profile_id,
++                        str(result.get("session_id") or session_id),
++                        completion_id,
++                    )
++                except Exception:
++                    logger.warning(
++                        "[api_server] Hermes Link Push chat event enqueue failed",
++                        exc_info=True,
++                    )
+             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
+             await response.write(b"data: [DONE]\n\n")
+@@ -5244,5 +5282,111 @@ class APIServerAdapter:
+         return job_id, None
+ 
++    @staticmethod
++    def _push_allowed_profiles() -> list[str]:
++        """Return profiles visible to this authenticated registration request."""
++        current = _api_request_profile.get() or "default"
++        if current != "default":
++            return [current]
++        try:
++            from hermes_cli.profiles import profiles_to_serve
++
++            served = [str(name) for name, _ in profiles_to_serve(multiplex=True)]
++            if served:
++                return list(dict.fromkeys(served))
++        except Exception:
++            pass
++        return [current]
++
++    async def _handle_push_device_register(self, request: "web.Request") -> "web.Response":
++        """POST /api/mobile/push/devices — register or refresh one device."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        body, body_err = await self._read_json_body(request)
++        if body_err:
++            return body_err
++        try:
++            from hermes_link_push import PushValidationError, register_device
++        except Exception:
++            logger.exception("Hermes Link Push module is unavailable")
++            return web.json_response(
++                _openai_error("Push registration is unavailable", code="push_unavailable"),
++                status=503,
++            )
++        try:
++            result = await asyncio.to_thread(
++                register_device, body, self._push_allowed_profiles()
++            )
++        except PushValidationError as exc:
++            return web.json_response(_openai_error(str(exc), code=exc.code), status=exc.status)
++        except Exception:
++            logger.exception("Hermes Link Push device registration failed")
++            return web.json_response(
++                _openai_error("Push registration failed", code="push_registration_failed"),
++                status=503,
++            )
++        return web.json_response(result)
++
++    async def _handle_push_device_update(self, request: "web.Request") -> "web.Response":
++        """PATCH /api/mobile/push/devices/{installation_id}."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        installation_id = request.match_info.get("installation_id", "")
++        body, body_err = await self._read_json_body(request)
++        if body_err:
++            return body_err
++        try:
++            from hermes_link_push import PushValidationError, update_device
++        except Exception:
++            logger.exception("Hermes Link Push module is unavailable")
++            return web.json_response(
++                _openai_error("Push registration is unavailable", code="push_unavailable"),
++                status=503,
++            )
++        try:
++            result = await asyncio.to_thread(
++                update_device,
++                installation_id,
++                body,
++                self._push_allowed_profiles(),
++            )
++        except PushValidationError as exc:
++            return web.json_response(_openai_error(str(exc), code=exc.code), status=exc.status)
++        except Exception:
++            logger.exception("Hermes Link Push device update failed")
++            return web.json_response(
++                _openai_error("Push device update failed", code="push_update_failed"),
++                status=503,
++            )
++        return web.json_response(result)
++
++    async def _handle_push_device_delete(self, request: "web.Request") -> "web.Response":
++        """DELETE /api/mobile/push/devices/{installation_id}."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        installation_id = request.match_info.get("installation_id", "")
++        try:
++            from hermes_link_push import PushValidationError, delete_device
++        except Exception:
++            logger.exception("Hermes Link Push module is unavailable")
++            return web.json_response(
++                _openai_error("Push registration is unavailable", code="push_unavailable"),
++                status=503,
++            )
++        try:
++            result = await asyncio.to_thread(delete_device, installation_id)
++        except PushValidationError as exc:
++            return web.json_response(_openai_error(str(exc), code=exc.code), status=exc.status)
++        except Exception:
++            logger.exception("Hermes Link Push device deletion failed")
++            return web.json_response(
++                _openai_error("Push device deletion failed", code="push_delete_failed"),
++                status=503,
++            )
++        return web.json_response(result)
++
+     async def _handle_list_jobs(self, request: "web.Request") -> "web.Response":
+         """GET /api/jobs — list all cron jobs."""
+         auth_err = self._check_auth(request)
+@@ -5504,8 +5504,14 @@ class APIServerAdapter:
+             if sanitized.get("prompt") and _scan_cron_prompt is not None:
+                 scan_error = _scan_cron_prompt(sanitized["prompt"])
+                 if scan_error:
+                     return web.json_response({"error": scan_error}, status=400)
++            session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
++            if not session_id:
++                session_id = str(body.get("session_id") or "").strip()
++            if session_id and re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", session_id):
++                existing = _cron_get(job_id)
++                if existing:
++                    origin = existing.get("origin") if isinstance(existing.get("origin"), dict) else {}
++                    sanitized["origin"] = {**origin, "session_id": session_id}
+             job = _cron_update(job_id, sanitized)
+             if not job:
+                 return web.json_response({"error": "Job not found"}, status=404)
+ 
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -581,6 +581,130 @@ def _get_hermes_home() -> Path:
+     return _hermes_home or get_hermes_home()
+ 
+ 
++def _append_hermes_link_job_result(
++    job: dict,
++    execution_id: str,
++    success: bool,
++    result_text: str = "",
++    error: str | None = None,
++) -> None:
++    """Best-effort, idempotent writeback of a cron result to its Hermes session."""
++    origin = job.get("origin")
++    origin = dict(origin) if isinstance(origin, dict) else {}
++    session_id = str(origin.get("session_id") or "").strip()
++    job_id = str(job.get("id") or "").strip()
++    if not job_id:
++        return
++    if not session_id or not re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", session_id):
++        session_id = f"hermes-link-cron-{job_id}"
++        try:
++            from hermes_state import SessionDB
++
++            home = _get_hermes_home().resolve()
++            db = SessionDB(db_path=home / "state.db")
++            try:
++                db.ensure_session(session_id, source="api_server")
++            finally:
++                db.close()
++
++            origin["session_id"] = session_id
++            from cron.jobs import update_job
++
++            updated = update_job(job_id, {"origin": origin})
++            if isinstance(updated, dict):
++                job.clear()
++                job.update(updated)
++            else:
++                job["origin"] = origin
++        except Exception:
++            logger.warning(
++                "Hermes Link cron session provisioning failed job=%s",
++                job_id,
++                exc_info=True,
++            )
++            return
++
++    execution_id = str(execution_id or "").strip()
++    if not job_id or not execution_id:
++        return
++    user_message_id = f"hermes-link:cron:{job_id}:{execution_id}:request"
++    result_message_id = f"hermes-link:cron:{job_id}:{execution_id}:result"
++    content = str(result_text or "").strip()
++    if not success:
++        content = content or f"定时任务执行失败：{str(error or '未知错误').strip()}"
++    if not content:
++        content = "定时任务完成，但 Agent 没有返回可显示的结果。"
++    try:
++        from hermes_state import SessionDB
++
++        home = _get_hermes_home().resolve()
++        db = SessionDB(db_path=home / "state.db")
++        try:
++            db.ensure_session(session_id, source="api_server")
++            if not db.has_platform_message_id(session_id, user_message_id):
++                prompt = str(job.get("prompt") or "").strip()
++                task_name = str(job.get("name") or job_id).strip()
++                db.append_message(
++                    session_id,
++                    "user",
++                    f"[定时任务：{task_name}]\n{prompt}" if prompt else f"[定时任务：{task_name}]",
++                    platform_message_id=user_message_id,
++                    display_kind="cron_request",
++                )
++            if not db.has_platform_message_id(session_id, result_message_id):
++                db.append_message(
++                    session_id,
++                    "assistant",
++                    content,
++                    platform_message_id=result_message_id,
++                    display_kind="cron_result",
++                    display_metadata={
++                        "job_id": job_id,
++                        "execution_id": execution_id,
++                        "success": bool(success),
++                    },
++                )
++        finally:
++            db.close()
++    except Exception:
++        logger.warning(
++            "Hermes Link cron result writeback failed job=%s session=%s",
++            job_id,
++            session_id,
++            exc_info=True,
++        )
++
++
++def _publish_hermes_link_job_event(
++    job: dict,
++    execution_id: str,
++    success: bool,
++    result_text: str = "",
++    error: str | None = None,
++) -> None:
++    """Best-effort Push event after a cron execution reaches a final state."""
++    _append_hermes_link_job_result(job, execution_id, success, result_text, error)
++    try:
++        from hermes_link_push import publish_job_finished
++
++        home = _get_hermes_home().resolve()
++        profile_id = home.name if home.parent.name == "profiles" else "default"
++        publish_job_finished(
++            profile_id,
++            str(job.get("id") or ""),
++            str(execution_id),
++            success=bool(success),
++            session_id=str((job.get("origin") or {}).get("session_id") or "")
++            if isinstance(job.get("origin"), dict) else "",
++        )
++    except Exception:
++        logger.warning(
++            "Hermes Link Push job event enqueue failed job=%s",
++            job.get("id"),
++            exc_info=True,
++        )
++
++
+ def _get_lock_paths() -> tuple[Path, Path]:
+     """Resolve cron lock paths at call time so profile/env changes are honored."""
+     hermes_home = _get_hermes_home()
+@@ -4026,11 +4121,17 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
+         if not _consume_interrupted_flag(job["id"]):
+             mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+         finish_execution(execution_id, success=success, error=error)
++        _publish_hermes_link_job_event(
++            job, execution_id, success,
++            final_response if success else _summarize_cron_failure_for_delivery(job, error),
++            error,
++        )
+         return True
+ 
+     except Exception as e:
+         logger.error("Error processing job %s: %s", job['id'], e)
+         if not _consume_interrupted_flag(job["id"]):
+             mark_job_run(job["id"], False, str(e))
+         finish_execution(execution_id, success=False, error=str(e))
++        _publish_hermes_link_job_event(job, execution_id, False, error=str(e))
+         return False

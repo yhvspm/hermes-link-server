@@ -1,0 +1,74 @@
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -1832,7 +1832,8 @@ class APIServerAdapter:
+             ("POST", "/api/mobile/push/devices", self._handle_push_device_register),
+             ("PATCH", "/api/mobile/push/devices/{installation_id}", self._handle_push_device_update),
+             ("DELETE", "/api/mobile/push/devices/{installation_id}", self._handle_push_device_delete),
++            ("GET", "/api/mobile/notifications/stream", self._handle_mobile_notification_stream),
+             ("POST", "/api/mobile/chat/cancel", self._handle_mobile_chat_cancel),
+             ("GET", "/api/jobs", self._handle_list_jobs),
+             ("POST", "/api/jobs", self._handle_create_job),
+             ("GET", "/api/jobs/{job_id}", self._handle_get_job),
+@@ -5591,1 +5591,61 @@ class APIServerAdapter:
++    async def _handle_mobile_notification_stream(self, request: "web.Request") -> "web.StreamResponse":
++        """Stream narrow completion events to a foreground self-hosted client."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        try:
++            from hermes_link_push import read_events_after
++        except Exception:
++            logger.exception("Hermes Link notification stream is unavailable")
++            return web.json_response(
++                _openai_error("Notification stream is unavailable", code="notification_stream_unavailable"),
++                status=503,
++            )
++
++        response = web.StreamResponse(
++            status=200,
++            headers={
++                "Content-Type": "text/event-stream",
++                "Cache-Control": "no-cache",
++                "Connection": "keep-alive",
++                "X-Accel-Buffering": "no",
++            },
++        )
++        await response.prepare(request)
++        cursor = request.query.get("after", "").strip()
++        allowed_profiles = self._push_allowed_profiles()
++        try:
++            if not cursor:
++                bootstrap = await asyncio.to_thread(
++                    read_events_after,
++                    "",
++                    allowed_profiles,
++                    limit=128,
++                )
++                if bootstrap:
++                    cursor = str(bootstrap[-1].get("event_id") or "")
++            while True:
++                events = await asyncio.to_thread(
++                    read_events_after,
++                    cursor,
++                    allowed_profiles,
++                    limit=32,
++                )
++                for event in events:
++                    cursor = str(event.get("event_id") or cursor)
++                    payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
++                    await response.write(
++                        f"event: hermes.notification\nid: {cursor}\ndata: {payload}\n\n".encode("utf-8")
++                    )
++                await response.write(b": keepalive\n\n")
++                await asyncio.sleep(15)
++        except (asyncio.CancelledError, ConnectionResetError, RuntimeError):
++            pass
++        finally:
++            try:
++                await response.write_eof()
++            except Exception:
++                pass
++        return response
++
+     async def _handle_list_jobs(self, request: "web.Request") -> "web.Response":

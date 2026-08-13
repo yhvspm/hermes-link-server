@@ -1,0 +1,8 @@
+{
+  "event_id": "evt_fixture_chat_1",
+  "event_type": "chat.completed",
+  "profile_id": "default",
+  "session_id": "session_fixture_1",
+  "run_id": "run_fixture_1",
+  "dedupe_key": "chat:session_fixture_1:run_fixture_1"
+}

@@ -1,0 +1,8 @@
+hermes-link.example.com {
+    @hermes_link path /hermes-link/v1/*
+    reverse_proxy @hermes_link 127.0.0.1:8765
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+    }
+}

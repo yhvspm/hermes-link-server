@@ -1,0 +1,24 @@
+{
+  "compatibilityMatrixVersion": 1,
+  "protocolVersion": 1,
+  "rows": [
+    {
+      "hermesAgent": "0.19.x",
+      "status": "migration-only",
+      "implementation": "compat/hermes_agent_v0_19 patches",
+      "requiredChecks": ["pairing", "sessions", "chat", "notifications"]
+    },
+    {
+      "hermesAgent": "0.20.x",
+      "status": "supported",
+      "implementation": "src/hermes_link/integrations/hermes_agent adapter",
+      "requiredChecks": ["server-info", "pairing", "profiles", "sessions", "models", "chat", "jobs", "direct-notifications"]
+    },
+    {
+      "hermesAgent": "future",
+      "status": "unverified",
+      "implementation": "new adapter test row required before support claim",
+      "requiredChecks": ["server-info", "protocol-paths", "profile-isolation", "negative-auth"]
+    }
+  ]
+}

@@ -1,0 +1,111 @@
+--- gateway/platforms/api_server.py
++++ gateway/platforms/api_server.py
+@@ -1807,4 +1807,6 @@
+             ("GET", "/v1/health", self._handle_health),
+             ("GET", "/v1/models", self._handle_models),
+             ("GET", "/api/model/options", self._handle_model_options),
++            ("GET", "/api/model/config", self._handle_model_config),
++            ("POST", "/api/model/config", self._handle_update_model_config),
+             ("GET", "/v1/capabilities", self._handle_capabilities),
+@@ -2821,4 +2823,101 @@
+                 status=500,
+             )
+ 
++    @staticmethod
++    def _model_config_payload(cfg: Dict[str, Any]) -> Dict[str, Any]:
++        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
++        agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
++        return {
++            "provider": str(model_cfg.get("provider") or "").strip(),
++            "model": str(model_cfg.get("default") or model_cfg.get("name") or "").strip(),
++            "max_tokens": model_cfg.get("max_tokens") if isinstance(model_cfg.get("max_tokens"), int) else 0,
++            "reasoning_effort": str(agent_cfg.get("reasoning_effort") or "").strip(),
++            "service_tier": str(agent_cfg.get("service_tier") or "").strip(),
++        }
++
++    async def _handle_model_config(self, request: "web.Request") -> "web.Response":
++        """GET /api/model/config — read the active profile's non-secret model config."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        try:
++            from hermes_cli.config import load_config
++            return web.json_response(self._model_config_payload(load_config()))
++        except Exception:
++            logger.exception("[%s] GET /api/model/config failed", self.name)
++            return web.json_response(
++                _openai_error("Failed to read model config.", code="model_config_failed"),
++                status=500,
++            )
++
++    async def _handle_update_model_config(self, request: "web.Request") -> "web.Response":
++        """POST /api/model/config — update only the active profile's safe model fields.
++
++        Provider credentials and endpoint URLs are deliberately outside this API.
++        Existing sessions keep their persisted runtime lock; this config applies to
++        newly-created sessions.
++        """
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        body, err = await self._read_json_body(request)
++        if err:
++            return err
++        allowed = {"provider", "model", "max_tokens", "reasoning_effort", "service_tier"}
++        unknown = sorted(set(body) - allowed)
++        if unknown:
++            return web.json_response(
++                _openai_error(
++                    f"Unsupported model config fields: {', '.join(unknown)}",
++                    code="unsupported_model_config_field",
++                ),
++                status=400,
++            )
++        provider = self._clean_runtime_id(body.get("provider"), max_len=80)
++        model = self._clean_runtime_id(body.get("model"))
++        if not provider or not model:
++            return web.json_response(
++                _openai_error("provider and model are required", code="missing_model_config"),
++                status=400,
++            )
++        max_tokens = body.get("max_tokens", 0)
++        if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 0 or max_tokens > 131072:
++            return web.json_response(
++                _openai_error("max_tokens must be 0 or an integer up to 131072", code="invalid_max_tokens"),
++                status=400,
++            )
++        reasoning_effort = str(body.get("reasoning_effort") or "").strip().lower()
++        if reasoning_effort not in {"", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
++            return web.json_response(
++                _openai_error("Unsupported reasoning_effort", code="invalid_reasoning_effort"),
++                status=400,
++            )
++        service_tier = str(body.get("service_tier") or "").strip().lower()
++        if service_tier not in {"", "priority"}:
++            return web.json_response(
++                _openai_error("service_tier must be empty or priority", code="invalid_service_tier"),
++                status=400,
++            )
++        try:
++            from hermes_cli.config import load_config, save_config
++            from hermes_cli.web_server import _apply_model_assignment_sync
++            _apply_model_assignment_sync("main", provider, model, "", "")
++            cfg = load_config()
++            if max_tokens:
++                cfg["model"]["max_tokens"] = max_tokens
++            else:
++                cfg["model"].pop("max_tokens", None)
++            agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
++            agent_cfg["reasoning_effort"] = reasoning_effort
++            agent_cfg["service_tier"] = service_tier
++            cfg["agent"] = agent_cfg
++            save_config(cfg)
++            return web.json_response({"ok": True, **self._model_config_payload(cfg)})
++        except Exception:
++            logger.exception("[%s] POST /api/model/config failed", self.name)
++            return web.json_response(
++                _openai_error("Failed to save model config.", code="model_config_save_failed"),
++                status=500,
++            )
++
+     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":

@@ -1,0 +1,49 @@
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -1577,6 +1577,13 @@
+         auth_header = request.headers.get("Authorization", "")
+         if auth_header.startswith("Bearer "):
+             token = auth_header[7:].strip()
++            if request.path.startswith("/api/mobile/"):
++                try:
++                    from hermes_link_pairing import authenticate_device_token
++                    if authenticate_device_token(token, _api_request_profile.get() or "default"):
++                        return None
++                except Exception:
++                    logger.warning("Hermes Link device token validation failed", exc_info=True)
+             # Compare as bytes: ``hmac.compare_digest`` raises TypeError on a
+             # str containing non-ASCII characters, and ``token`` is the raw
+             # client-supplied header. A stray non-ASCII byte in the key would
+@@ -1844,6 +1851,8 @@
+             ("GET", "/api/mobile/notifications/stream", self._handle_mobile_notification_stream),
+             ("POST", "/api/mobile/chat/cancel", self._handle_mobile_chat_cancel),
+            ("POST", "/api/mobile/pair", self._handle_mobile_pair),
++            ("DELETE", "/api/mobile/pair/device", self._handle_mobile_pair_device),
+             ("GET", "/api/jobs", self._handle_list_jobs),
+             ("POST", "/api/jobs", self._handle_create_job),
+             ("GET", "/api/jobs/{job_id}", self._handle_get_job),
+@@ -3208,6 +3217,65 @@
+             )
+         return web.json_response(result)
+ 
++    async def _handle_mobile_pair_device(self, request: "web.Request") -> "web.Response":
++        """DELETE /api/mobile/pair/device - revoke the current device token."""
++        auth_err = self._check_auth(request)
++        if auth_err:
++            return auth_err
++        token = request.headers.get("Authorization", "")[7:].strip()
++        try:
++            from hermes_link_pairing import revoke_device_token
++            revoked = await asyncio.to_thread(revoke_device_token, token)
++        except Exception:
++            logger.exception("Hermes Link device token revoke failed")
++            return web.json_response(
++                _openai_error("Device revoke service is unavailable", code="device_revoke_unavailable"),
++                status=503,
++            )
++        return web.json_response({"ok": True, "revoked": bool(revoked)})
++
+     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
+         """GET /api/sessions — list persisted Hermes sessions."""
+         auth_err = self._check_auth(request)

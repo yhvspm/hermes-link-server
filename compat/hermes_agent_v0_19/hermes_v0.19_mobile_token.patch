@@ -1,0 +1,35 @@
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@
+     def _expected_api_key(self) -> str:
+         """Return the API key authorized for the URL-selected profile."""
++        mobile_api_key = os.environ.get("HERMES_LINK_MOBILE_API_TOKEN", "").strip()
++        if mobile_api_key:
++            return mobile_api_key
++
+         profile = _api_request_profile.get()
+
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@
+     def _check_auth(self, request: "web.Request") -> Optional["web.Response"]:
+         profile = _api_request_profile.get()
+         is_named_profile = bool(profile and profile != "default")
+         expected_key = self._expected_api_key()
++        additional_mobile_key = os.environ.get(
++            "HERMES_LINK_MOBILE_API_TOKEN_ADDITIONAL", ""
++        ).strip()
++        expected_keys = tuple(
++            key for key in (expected_key, additional_mobile_key) if key
++        )
+-        if not expected_key:
++        if not expected_keys:
+@@
+-            if hmac.compare_digest(token.encode(), expected_key.encode()):
++            if any(
++                hmac.compare_digest(token.encode(), expected.encode())
++                for expected in expected_keys
++            ):
+                 return None  # Auth OK

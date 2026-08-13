@@ -1,0 +1,65 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+    network_mode: host
+    env_file:
+      - ${HERMES_LINK_SERVER_ENV_FILE:-/dev/null}
+      - ${HERMES_LINK_INTERNAL_ENV_FILE:?Set HERMES_LINK_INTERNAL_ENV_FILE to the root-only generated internal credential file.}
+    environment:
+      HERMES_LINK_PAIRING_DB: /var/lib/hermes-link-server/pairing.db
+      HERMES_HOME: /var/lib/hermes-agent
+      HERMES_LINK_AGENT_HOME: /var/lib/hermes-agent
+      HERMES_LINK_PROFILE_IDS: ${HERMES_LINK_PROFILE_IDS:-}
+      HERMES_LINK_REDACTED_LOG_DIR: /var/lib/hermes-link-server/redacted-logs
+      HERMES_LINK_BRIDGE_PORT: ${HERMES_LINK_BRIDGE_PORT:-8765}
+    volumes:
+      - hermes-link-state:/var/lib/hermes-link-server
+      - ${HERMES_HOME_HOST_PATH:?Set HERMES_HOME_HOST_PATH to the Hermes metadata directory.}:/var/lib/hermes-agent:ro
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=64m
+    restart: unless-stopped
+
+  log-exporter:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+    network_mode: none
+    user: "0:0"
+    environment:
+      HERMES_LINK_RAW_LOG_DIR: /var/lib/hermes-agent-logs
+      HERMES_LINK_REDACTED_LOG_DIR: /var/lib/hermes-link-server/redacted-logs
+    volumes:
+      - hermes-link-state:/var/lib/hermes-link-server
+      - ${HERMES_HOME_HOST_PATH:?Set HERMES_HOME_HOST_PATH to the Hermes metadata directory.}/logs:/var/lib/hermes-agent-logs:ro
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    command: ["python", "-m", "hermes_link.observability.redacted_logs"]
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.8-alpine
+    network_mode: host
+    depends_on:
+      - server
+    profiles: ["proxy"]
+    environment:
+      HERMES_LINK_PUBLIC_HOST: ${HERMES_LINK_PUBLIC_HOST:?Set HERMES_LINK_PUBLIC_HOST.}
+      HERMES_LINK_LISTEN_PORT: ${HERMES_LINK_LISTEN_PORT:?Set HERMES_LINK_LISTEN_PORT.}
+      HERMES_LINK_BRIDGE_PORT: ${HERMES_LINK_BRIDGE_PORT:-8765}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - hermes-link-caddy-data:/data
+      - hermes-link-caddy-config:/config
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=64m
+    restart: unless-stopped
+
+volumes:
+  hermes-link-state:
+  hermes-link-caddy-data:
+  hermes-link-caddy-config:
