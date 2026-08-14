@@ -12,6 +12,7 @@
     "jobs": true,
     "cron": true,
     "pairing": true,
+    "executionTrace": true,
     "directNotifications": true,
     "cloudNotifications": true
   }

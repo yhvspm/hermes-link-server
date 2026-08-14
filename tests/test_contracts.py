@@ -79,6 +79,7 @@ class PublicContractTests(unittest.TestCase):
                 "jobs",
                 "cron",
                 "pairing",
+                "executionTrace",
                 "directNotifications",
                 "cloudNotifications",
             },

@@ -22,6 +22,7 @@
         "jobs",
         "cron",
         "pairing",
+        "executionTrace",
         "directNotifications",
         "cloudNotifications"
       ],
@@ -32,6 +33,7 @@
         "jobs": {"type": "boolean"},
         "cron": {"type": "boolean"},
         "pairing": {"type": "boolean"},
+        "executionTrace": {"type": "boolean"},
         "directNotifications": {"type": "boolean"},
         "cloudNotifications": {"type": "boolean"}
       }

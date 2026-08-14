@@ -14,6 +14,7 @@ DEFAULT_FEATURES: dict[str, bool] = {
     "jobs": True,
     "cron": True,
     "pairing": True,
+    "executionTrace": True,
     "directNotifications": True,
     "cloudNotifications": True,
 }

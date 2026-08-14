@@ -67,6 +67,9 @@ LOG_PATTERN = re.compile(
     r"(?:\s+\[[^\]]+\])?\s+(?P<source>[^:]+):\s*(?P<message>.*)$"
 )
 PROFILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+TRACE_TOOL_PATTERN = re.compile(r"^[a-z0-9._-]{1,40}$")
+TRACE_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+TRACE_DETAIL_MAX_LENGTH = 280
 
 
 def discover_profile_ids(hermes_home: Path = HERMES_HOME) -> list[str]:
@@ -205,6 +208,71 @@ def _read_model_config(profile_id: str) -> dict[str, str] | None:
     }
 
 
+def _normalize_trace_tool(raw_tool: object) -> str:
+    tool = str(raw_tool or "agent-tool").strip().lower()
+    return tool if TRACE_TOOL_PATTERN.fullmatch(tool) else "agent-tool"
+
+
+def _normalize_trace_status(raw_status: object) -> str:
+    return "completed" if str(raw_status or "").strip().lower() == "completed" else "running"
+
+
+def _normalize_trace_detail(raw_detail: object) -> str:
+    """Return the redacted, bounded execution detail emitted by Hermes Agent."""
+    detail = str(raw_detail or "").strip()
+    if not detail:
+        return ""
+    try:
+        detail = redact_sensitive_text(detail)
+    except Exception:
+        return ""
+    return " ".join(detail.split())[:TRACE_DETAIL_MAX_LENGTH]
+
+
+def _execution_sse_event(payload: dict[str, object]) -> str:
+    return "event: hermes.execution.event\ndata: " + json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _normalize_chat_sse_event(event_block: str) -> str:
+    """Publish a stable, current-task execution event from Hermes Agent callbacks."""
+    event_name = "message"
+    data_parts: list[str] = []
+    for line in event_block.split("\n"):
+        if line.startswith("event:"):
+            event_name = line[6:].strip()
+        elif line.startswith("data:"):
+            data_parts.append(line[5:].strip())
+    if event_name != "hermes.tool.progress" or not data_parts:
+        return event_block
+    try:
+        upstream = json.loads("\n".join(data_parts))
+    except json.JSONDecodeError:
+        return event_block
+    if not isinstance(upstream, dict):
+        return event_block
+    tool = _normalize_trace_tool(upstream.get("tool"))
+    status = _normalize_trace_status(upstream.get("status"))
+    raw_id = str(upstream.get("toolCallId") or "").strip()
+    trace_id = raw_id if TRACE_ID_PATTERN.fullmatch(raw_id) else ""
+    action = "已完成工具调用" if status == "completed" else "正在调用工具"
+    payload = {
+        "id": trace_id,
+        "type": "tool",
+        "phase": "completed" if status == "completed" else "started",
+        "tool": tool,
+        "status": status,
+        "summary": f"{action}：{tool}",
+    }
+    detail = _normalize_trace_detail(upstream.get("label"))
+    if detail:
+        payload["detail"] = detail
+    return _execution_sse_event(payload)
+
+
 class HermesLinkHandler(BaseHTTPRequestHandler):
     server_version = "HermesLinkBridge/1.0"
 
@@ -262,15 +330,40 @@ class HermesLinkHandler(BaseHTTPRequestHandler):
             if not profile_header:
                 profile_header = ",".join(discover_profile_ids())
             self.send_header("X-Hermes-Profiles", profile_header)
+            is_chat_stream = (
+                path.endswith("/v1/chat/completions")
+                and response.headers.get("Content-Type", "").lower().startswith("text/event-stream")
+            )
             response_length = response.headers.get("Content-Length")
-            if response_length:
+            if response_length and not is_chat_stream:
                 self.send_header("Content-Length", response_length)
             self.end_headers()
+            if is_chat_stream:
+                self.wfile.write(_execution_sse_event({
+                    "type": "agent",
+                    "phase": "accepted",
+                    "summary": "Agent 已接收任务",
+                }).encode("utf-8") + b"\n\n")
+                self.wfile.flush()
+            sse_buffer = ""
+            stream_read = getattr(response, "read1", response.read)
             while True:
-                chunk = response.read(65536)
+                chunk = stream_read(1024) if is_chat_stream else response.read(65536)
                 if not chunk:
                     break
-                self.wfile.write(chunk)
+                if not is_chat_stream:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                    continue
+                sse_buffer += chunk.decode("utf-8", errors="replace").replace("\r", "")
+                while "\n\n" in sse_buffer:
+                    event_block, sse_buffer = sse_buffer.split("\n\n", 1)
+                    normalized = _normalize_chat_sse_event(event_block)
+                    self.wfile.write(f"{normalized}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+            if is_chat_stream and sse_buffer.strip():
+                normalized = _normalize_chat_sse_event(sse_buffer)
+                self.wfile.write(f"{normalized}\n\n".encode("utf-8"))
                 self.wfile.flush()
         finally:
             response.close()
