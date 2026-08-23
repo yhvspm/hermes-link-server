@@ -1,0 +1,131 @@
+name: Release immutable Server image
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Bind the Git tag to the package version
+        id: release
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          test "$GITHUB_REF_NAME" = "v$version"
+          project_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          test "$version" = "$project_version"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'source_commit=%s\n' "$(git rev-list -n 1 "$GITHUB_REF_NAME")" >> "$GITHUB_OUTPUT"
+      - run: python -m pip install -e .
+      - name: Unit, protocol, boundary, and secret tests
+        run: |
+          python -m unittest discover -s tests -t . -p 'test_*.py'
+          python scripts/architecture_gate.py
+          python scripts/secret_scan.py
+          python scripts/public_release_gate.py
+      - name: Build standard release image
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Release image metadata
+        id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=tag
+      - name: Build and publish image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+      - name: Create and verify the release manifest
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY}@${IMAGE_DIGEST}"
+          python scripts/release_manifest.py create \
+            --root . \
+            --version "$RELEASE_VERSION" \
+            --source-commit "$SOURCE_COMMIT" \
+            --image "$image" \
+            --output release-manifest.json
+          python scripts/release_manifest.py verify \
+            --manifest release-manifest.json \
+            --version "$RELEASE_VERSION"
+          for asset in \
+            install.sh \
+            deploy/standard/compose.yaml \
+            deploy/standard/Caddyfile \
+            deploy/standard/.env.example \
+            deploy/standard/bin/hermes-link \
+            scripts/deployment_helpers.py \
+            scripts/bootstrap-hermes-agent-access.sh \
+            scripts/manage-internal-credential.py \
+            scripts/release_manifest.py; do
+            python scripts/release_manifest.py verify-file \
+              --manifest release-manifest.json \
+              --version "$RELEASE_VERSION" \
+              --path "$asset" \
+              --file "$asset"
+          done
+          sha256sum release-manifest.json > release-manifest.json.sha256
+          sha256sum --check release-manifest.json.sha256
+          docker buildx imagetools inspect "$image"
+      - name: Verify the digest image is publicly pullable
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY}@${IMAGE_DIGEST}"
+          docker logout ghcr.io || true
+          docker buildx imagetools inspect "$image"
+      - name: Publish the release assets from a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+          gh release upload "$GITHUB_REF_NAME" release-manifest.json release-manifest.json.sha256
+          gh release edit "$GITHUB_REF_NAME" --draft=false
+      - name: Verify the published release and immutable image reference
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft')" = false
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq '.immutable')" = true
+          mkdir published-release
+          gh release download "$GITHUB_REF_NAME" --dir published-release \
+            --pattern release-manifest.json \
+            --pattern release-manifest.json.sha256
+          (
+            cd published-release
+            sha256sum --check release-manifest.json.sha256
+          )
+          python scripts/release_manifest.py verify \
+            --manifest published-release/release-manifest.json \
+            --version "$RELEASE_VERSION"
+          test "$(python scripts/release_manifest.py image --manifest published-release/release-manifest.json --version "$RELEASE_VERSION")" = "ghcr.io/${GITHUB_REPOSITORY}@${IMAGE_DIGEST}"

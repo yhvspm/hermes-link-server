@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import re
 import sqlite3
+import threading
+import uuid
 from collections import deque
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -21,15 +25,25 @@ try:
 except ImportError:
     from hermes_link.security.redaction import redact_sensitive_text
 from hermes_link.api.capabilities import server_info
+from hermes_link.identity import (
+    clear_cloud_config,
+    configure_cloud,
+    create_cloud_binding_attestation,
+    get_or_create_identity,
+    load_cloud_config,
+    public_identity,
+)
 from hermes_link.integrations.hermes_agent.adapter import (
     DeviceAuthorizationError,
     HermesAgentAdapter,
     _bearer_token,
+    _profile_id_for_protocol_path,
     prepare_agent_headers,
     protocol_to_agent_path,
 )
+from hermes_link.notifications.cloud_sender import CloudEventSender, CloudTransportError
 from hermes_link.pairing.http import exchange_pairing_payload
-from hermes_link.pairing.store import revoke_device_token
+from hermes_link.pairing.store import device_profile_ids, revoke_device_token
 
 
 HOST = "127.0.0.1"
@@ -70,6 +84,8 @@ PROFILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 TRACE_TOOL_PATTERN = re.compile(r"^[a-z0-9._-]{1,40}$")
 TRACE_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 TRACE_DETAIL_MAX_LENGTH = 280
+PROXY_UPSTREAM_TIMEOUT_SECONDS = 300
+CHAT_STREAM_UPSTREAM_TIMEOUT_SECONDS = 3600
 
 
 def discover_profile_ids(hermes_home: Path = HERMES_HOME) -> list[str]:
@@ -273,6 +289,119 @@ def _normalize_chat_sse_event(event_block: str) -> str:
     return _execution_sse_event(payload)
 
 
+def _chat_stream_terminal_state(event_block: str) -> str:
+    """Return the terminal state of one OpenAI-compatible chat SSE block."""
+
+    data_parts: list[str] = []
+    for line in event_block.split("\n"):
+        if line.startswith("data:"):
+            data_parts.append(line[5:].strip())
+    data = "\n".join(data_parts).strip()
+    if data == "[DONE]":
+        return "completed"
+    if not data:
+        return ""
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return ""
+    finish_reason = choices[0].get("finish_reason")
+    if finish_reason is None:
+        return ""
+    normalized_reason = str(finish_reason).strip().lower()
+    if normalized_reason in {"error", "cancel", "cancelled", "canceled"}:
+        return "failed"
+    return "completed"
+
+
+def _relay_chat_stream(
+    response: object,
+    write_chunk: Callable[[bytes], bool],
+) -> str:
+    """Relay a chat stream while draining Agent output after client disconnect."""
+
+    sse_buffer = ""
+    chat_terminal_state = ""
+    client_connected = True
+    stream_read = getattr(response, "read1", None)
+    if stream_read is None:
+        stream_read = response.read  # type: ignore[attr-defined]
+    while True:
+        chunk = stream_read(1024)
+        if not chunk:
+            break
+        sse_buffer += chunk.decode("utf-8", errors="replace").replace("\r", "")
+        while "\n\n" in sse_buffer:
+            event_block, sse_buffer = sse_buffer.split("\n\n", 1)
+            terminal_state = _chat_stream_terminal_state(event_block)
+            if terminal_state:
+                chat_terminal_state = terminal_state
+            normalized = _normalize_chat_sse_event(event_block)
+            if client_connected:
+                try:
+                    client_connected = write_chunk(f"{normalized}\n\n".encode("utf-8"))
+                except OSError:
+                    client_connected = False
+    if sse_buffer.strip():
+        terminal_state = _chat_stream_terminal_state(sse_buffer)
+        if terminal_state:
+            chat_terminal_state = terminal_state
+        normalized = _normalize_chat_sse_event(sse_buffer)
+        if client_connected:
+            try:
+                write_chunk(f"{normalized}\n\n".encode("utf-8"))
+            except OSError:
+                pass
+    return chat_terminal_state
+
+
+def _publish_cloud_chat_completed(profile_id: str, session_id: str) -> None:
+    """Publish a content-free Cloud event after a completed chat stream."""
+
+    if not profile_id or not session_id:
+        return
+    try:
+        config = load_cloud_config()
+        if not config:
+            return
+        identity = get_or_create_identity()
+        if config.get("server_id") != identity["server_id"]:
+            return
+        run_id = f"run_{uuid.uuid4().hex}"
+        CloudEventSender(
+            config["cloud_url"],
+            identity["server_id"],
+            identity["private_key_pem"],
+        ).publish(
+            {
+                "event_id": f"evt_{uuid.uuid4().hex}",
+                "event_type": "chat.completed",
+                "profile_id": profile_id,
+                "session_id": session_id,
+                "run_id": run_id,
+                "dedupe_key": f"chat:{session_id}:{run_id}",
+            },
+            config["installation_id"],
+        )
+    except (CloudTransportError, KeyError, OSError, RuntimeError, ValueError):
+        return
+
+
+def _schedule_cloud_chat_completed(profile_id: str, session_id: str) -> None:
+    if not profile_id or not session_id:
+        return
+    threading.Thread(
+        target=_publish_cloud_chat_completed,
+        args=(profile_id, session_id),
+        daemon=True,
+    ).start()
+
+
 class HermesLinkHandler(BaseHTTPRequestHandler):
     server_version = "HermesLinkBridge/1.0"
 
@@ -284,6 +413,50 @@ class HermesLinkHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _cloud_control_profiles(self) -> list[str] | None:
+        """Authorize a local Cloud control request without forwarding it to Agent."""
+
+        token = _bearer_token(self.headers)
+        if token.startswith("hmd_"):
+            profiles = device_profile_ids(token)
+            if profiles is None:
+                return None
+            return profiles or discover_profile_ids()
+        expected = (
+            os.environ.get("HERMES_LINK_MOBILE_API_TOKEN", "").strip()
+            or os.environ.get("HERMES_LINK_AGENT_TOKEN", "").strip()
+        )
+        if len(expected) < 8 or not token or not hmac.compare_digest(token, expected):
+            return None
+        return discover_profile_ids()
+
+    def _read_local_json(self, *, limit: int = 16 * 1024) -> dict[str, object] | None:
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json(400, {"error": {"message": "Invalid Content-Length", "code": "cloud_request_invalid"}})
+            return None
+        if content_length < 0 or content_length > limit:
+            self._send_json(413, {"error": {"message": "Cloud payload is too large", "code": "cloud_request_invalid"}})
+            return None
+        try:
+            payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_json(400, {"error": {"message": "Invalid Cloud JSON", "code": "cloud_request_invalid"}})
+            return None
+        if not isinstance(payload, dict):
+            self._send_json(400, {"error": {"message": "Cloud payload must be an object", "code": "cloud_request_invalid"}})
+            return None
+        return payload
+
+    def _write_chat_stream_chunk(self, chunk: bytes) -> bool:
+        try:
+            self.wfile.write(chunk)
+            self.wfile.flush()
+            return True
+        except OSError:
+            return False
 
     def _proxy_agent(self, parsed: object) -> bool:
         path = protocol_to_agent_path(parsed.path)  # type: ignore[attr-defined]
@@ -315,8 +488,15 @@ class HermesLinkHandler(BaseHTTPRequestHandler):
             return True
         headers["Accept"] = self.headers.get("Accept", "application/json")
         request = Request(target, data=body, headers=headers, method=self.command)
+        is_chat_request = path.endswith("/v1/chat/completions")
         try:
-            response = urlopen(request, timeout=300)
+            response = urlopen(
+                request,
+                timeout=(
+                    CHAT_STREAM_UPSTREAM_TIMEOUT_SECONDS
+                    if is_chat_request else PROXY_UPSTREAM_TIMEOUT_SECONDS
+                ),
+            )
         except HTTPError as error:
             response = error
         except (URLError, TimeoutError, OSError):
@@ -337,36 +517,41 @@ class HermesLinkHandler(BaseHTTPRequestHandler):
             response_length = response.headers.get("Content-Length")
             if response_length and not is_chat_stream:
                 self.send_header("Content-Length", response_length)
-            self.end_headers()
-            if is_chat_stream:
-                self.wfile.write(_execution_sse_event({
-                    "type": "agent",
-                    "phase": "accepted",
-                    "summary": "Agent 已接收任务",
-                }).encode("utf-8") + b"\n\n")
-                self.wfile.flush()
-            sse_buffer = ""
-            stream_read = getattr(response, "read1", response.read)
-            while True:
-                chunk = stream_read(1024) if is_chat_stream else response.read(65536)
-                if not chunk:
-                    break
+            client_connected = True
+            try:
+                self.end_headers()
+            except OSError:
                 if not is_chat_stream:
+                    return True
+                client_connected = False
+            chat_terminal_state = ""
+            if is_chat_stream:
+                if client_connected:
+                    client_connected = self._write_chat_stream_chunk(
+                        _execution_sse_event({
+                            "type": "agent",
+                            "phase": "accepted",
+                            "summary": "Agent 已接收任务",
+                        }).encode("utf-8") + b"\n\n"
+                    )
+                chat_terminal_state = _relay_chat_stream(
+                    response,
+                    self._write_chat_stream_chunk if client_connected else lambda _chunk: False,
+                )
+            else:
+                while True:
+                    chunk = response.read(65536)
+                    if not chunk:
+                        break
                     self.wfile.write(chunk)
                     self.wfile.flush()
-                    continue
-                sse_buffer += chunk.decode("utf-8", errors="replace").replace("\r", "")
-                while "\n\n" in sse_buffer:
-                    event_block, sse_buffer = sse_buffer.split("\n\n", 1)
-                    normalized = _normalize_chat_sse_event(event_block)
-                    self.wfile.write(f"{normalized}\n\n".encode("utf-8"))
-                    self.wfile.flush()
-            if is_chat_stream and sse_buffer.strip():
-                normalized = _normalize_chat_sse_event(sse_buffer)
-                self.wfile.write(f"{normalized}\n\n".encode("utf-8"))
-                self.wfile.flush()
         finally:
             response.close()
+        if is_chat_stream and chat_terminal_state == "completed":
+            _schedule_cloud_chat_completed(
+                _profile_id_for_protocol_path(parsed.path),  # type: ignore[attr-defined]
+                str(self.headers.get("X-Hermes-Session-Id", "")).strip(),
+            )
         return True
 
     def do_GET(self) -> None:
@@ -376,12 +561,39 @@ class HermesLinkHandler(BaseHTTPRequestHandler):
                 os.environ.get("HERMES_AGENT_BASE_URL", "http://127.0.0.1:8642")
             )
             runtime = adapter.runtime_status()
+            identity: dict[str, str] | None = None
+            try:
+                identity = public_identity()
+            except (OSError, RuntimeError, ValueError):
+                identity = None
             self._send_json(
                 200,
                 server_info(
                     str(runtime.get("hermes_version") or "unknown"),
                     runtime=runtime,
+                    features={"cloudMultiBinding": identity is not None},
+                    server_id=identity["server_id"] if identity is not None else None,
                 ),
+            )
+            return
+        if parsed.path == "/hermes-link/v1/cloud/identity":
+            profiles = self._cloud_control_profiles()
+            if profiles is None:
+                self._send_json(401, {"error": {"message": "Cloud control authorization failed", "code": "cloud_control_unauthorized"}})
+                return
+            try:
+                identity = public_identity()
+            except (OSError, RuntimeError, ValueError):
+                self._send_json(503, {"error": {"message": "Hermes Server Cloud identity is unavailable", "code": "cloud_identity_unavailable"}})
+                return
+            self._send_json(
+                200,
+                {
+                    "schema_version": 2,
+                    "server_id": identity["server_id"],
+                    "public_key": identity["public_key"],
+                    "profiles": profiles,
+                },
             )
             return
         if parsed.path == "/health":
@@ -445,6 +657,41 @@ class HermesLinkHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/hermes-link/v1/cloud/attestation":
+            profiles = self._cloud_control_profiles()
+            if profiles is None:
+                self._send_json(401, {"error": {"message": "Cloud control authorization failed", "code": "cloud_control_unauthorized"}})
+                return
+            payload = self._read_local_json()
+            if payload is None:
+                return
+            if set(payload) - {"schema_version", "cloud_url", "installation_id"}:
+                self._send_json(400, {"error": {"message": "Cloud attestation fields are invalid", "code": "cloud_attestation_invalid"}})
+                return
+            try:
+                result = create_cloud_binding_attestation(payload, profiles)
+            except (OSError, RuntimeError, ValueError):
+                self._send_json(400, {"error": {"message": "Cloud attestation is invalid", "code": "cloud_attestation_invalid"}})
+                return
+            self._send_json(200, result)
+            return
+        if parsed.path == "/hermes-link/v1/cloud/configure":
+            if self._cloud_control_profiles() is None:
+                self._send_json(401, {"error": {"message": "Cloud control authorization failed", "code": "cloud_control_unauthorized"}})
+                return
+            payload = self._read_local_json()
+            if payload is None:
+                return
+            if set(payload) - {"schema_version", "cloud_url", "installation_id", "server_id"}:
+                self._send_json(400, {"error": {"message": "Cloud configuration fields are invalid", "code": "cloud_config_invalid"}})
+                return
+            try:
+                self._send_json(200, configure_cloud(payload))
+            except ValueError:
+                self._send_json(400, {"error": {"message": "Cloud configuration is invalid", "code": "cloud_config_invalid"}})
+            except (OSError, RuntimeError):
+                self._send_json(503, {"error": {"message": "Cloud configuration is unavailable", "code": "cloud_config_unavailable"}})
+            return
         if parsed.path == "/hermes-link/v1/pairing":
             try:
                 content_length = int(self.headers.get("Content-Length", "0"))
@@ -475,6 +722,15 @@ class HermesLinkHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/hermes-link/v1/cloud/configure":
+            if self._cloud_control_profiles() is None:
+                self._send_json(401, {"error": {"message": "Cloud control authorization failed", "code": "cloud_control_unauthorized"}})
+                return
+            try:
+                self._send_json(200, clear_cloud_config())
+            except OSError:
+                self._send_json(503, {"error": {"message": "Cloud configuration is unavailable", "code": "cloud_config_unavailable"}})
+            return
         if parsed.path == "/hermes-link/v1/pairing/device":
             token = _bearer_token(self.headers)
             if token.startswith("hmd_"):

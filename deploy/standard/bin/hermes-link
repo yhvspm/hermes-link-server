@@ -1,0 +1,598 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+root_dir="$(cd -- "$script_dir/.." && pwd)"
+env_file="$root_dir/.env"
+helper="$root_dir/bin/lib/deployment_helpers.py"
+release_manifest_helper="$root_dir/bin/lib/release_manifest.py"
+release_image_repository='ghcr.io/yhvspm/hermes-link-server'
+default_release_download_base_url='https://github.com/yhvspm/hermes-link-server/releases/download'
+bridge_port='18765'
+
+usage() {
+  cat <<'EOF'
+Usage: hermes-link <command> [options]
+
+Commands:
+  status                 Show non-sensitive deployment status
+  doctor                 Diagnose Docker, Hermes, identity, Profiles and HTTPS
+  update [--version V]   Safely update a pinned release and roll back on failure
+  restart                Restart the managed runtime without deleting state
+  logs [server|log-exporter|caddy]
+                         Show the latest managed container logs
+  sync                   Re-discover Hermes Profile directory names
+  uninstall [--purge]    Stop the runtime; --purge requires a second confirmation
+
+Run mutating commands with sudo. The CLI never prints Agent tokens, private
+keys, Cloud secrets, or the persisted server ID value.
+EOF
+}
+
+fail() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+require_installation() {
+  [[ -f "$env_file" && -x "$helper" && -x "$release_manifest_helper" && -f "$root_dir/compose.yaml" ]] || \
+    fail "This command must run from a Hermes Link standard installation."
+  bridge_port="$(configured_bridge_port)"
+}
+
+require_root() {
+  [[ "${EUID}" -eq 0 ]] || fail 'Run this command with sudo.'
+}
+
+env_get() {
+  local key="$1"
+  awk -v key="$key" 'index($0, key "=") == 1 {print substr($0, length(key) + 2); exit}' "$env_file"
+}
+
+configured_bridge_port() {
+  local configured=''
+  configured="$(env_get HERMES_LINK_BRIDGE_PORT 2>/dev/null || true)"
+  if [[ -z "$configured" ]]; then
+    printf '%s' '18765'
+    return
+  fi
+  [[ "$configured" =~ ^[0-9]+$ ]] && (( configured >= 1024 && configured <= 65535 )) || \
+    fail 'HERMES_LINK_BRIDGE_PORT must be a valid unprivileged TCP port'
+  printf '%s' "$configured"
+}
+
+env_set() {
+  local key="$1"
+  local value="$2"
+  python3 - "$env_file" "$key" "$value" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+key = sys.argv[2]
+value = sys.argv[3]
+lines = path.read_text(encoding="utf-8").splitlines()
+prefix = f"{key}="
+updated = False
+result: list[str] = []
+for line in lines:
+    if line.startswith(prefix):
+        result.append(prefix + value)
+        updated = True
+    else:
+        result.append(line)
+if not updated:
+    result.append(prefix + value)
+temporary = path.with_name(f".{path.name}.tmp")
+temporary.write_text("\n".join(result) + "\n", encoding="utf-8")
+temporary.chmod(0o600)
+temporary.replace(path)
+PY
+}
+
+proxy_mode() {
+  env_get HERMES_LINK_PROXY_MODE
+}
+
+compose() {
+  local command=(docker compose --env-file "$env_file" --project-directory "$root_dir")
+  if [[ "$(proxy_mode)" == 'caddy' ]]; then command+=(--profile caddy); fi
+  command+=(-f "$root_dir/compose.yaml")
+  "${command[@]}" "$@"
+}
+
+docker_ready() {
+  command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 && docker info >/dev/null 2>&1
+}
+
+service_running() {
+  local service="$1"
+  compose ps --status running --services 2>/dev/null | grep -Fxq "$service"
+}
+
+local_health() {
+  curl --fail --silent --max-time 5 "http://127.0.0.1:$bridge_port/health" >/dev/null
+}
+
+server_info_fields() {
+  local payload=''
+  payload="$(curl --fail --silent --max-time 5 "http://127.0.0.1:$bridge_port/hermes-link/v1/server-info")" || return 1
+  printf '%s' "$payload" | python3 "$helper" server-info
+}
+
+identity_server_id() {
+  python3 "$helper" server-id --identity-file "$root_dir/data/server/server-identity.json"
+}
+
+public_url() {
+  env_get HERMES_LINK_PUBLIC_URL
+}
+
+public_port() {
+  env_get HERMES_LINK_PUBLIC_PORT
+}
+
+public_https_reachable() {
+  curl --fail --silent --max-time 10 "$(public_url)/hermes-link/v1/server-info" >/dev/null
+}
+
+public_port_listening() {
+  python3 - "$(public_port)" <<'PY'
+import socket
+import sys
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.settimeout(2)
+    raise SystemExit(0 if sock.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0 else 1)
+PY
+}
+
+configured_profiles() {
+  env_get HERMES_LINK_PROFILE_IDS
+}
+
+profile_count() {
+  local profiles="$1"
+  local values=()
+  IFS=, read -r -a values <<< "$profiles"
+  printf '%s' "${#values[@]}"
+}
+
+print_row() {
+  printf '%-14s %s\n' "$1" "$2"
+}
+
+status_command() {
+  require_installation
+  local fields=''
+  local gateway_state='unavailable'
+  local active_agents='0'
+  local api_server_id=''
+  local cloud_multi_binding='false'
+  local persisted_server_id=''
+  if fields="$(server_info_fields 2>/dev/null)"; then
+    IFS=$'\t' read -r gateway_state active_agents api_server_id cloud_multi_binding <<< "$fields"
+  fi
+  persisted_server_id="$(identity_server_id 2>/dev/null || true)"
+
+  printf '%s\n\n' 'Hermes Link Server'
+  print_row 'Version' "$(env_get HERMES_LINK_VERSION)"
+  if docker_ready && service_running server; then print_row 'Server' '✓ Running'; else print_row 'Server' '! Not running'; fi
+  if [[ "$gateway_state" != 'unavailable' ]]; then print_row 'Hermes' '✓ Connected'; else print_row 'Hermes' '! Unavailable'; fi
+  print_row 'Agents' "✓ $active_agents active / $(profile_count "$(configured_profiles)") exposed"
+  if [[ -n "$persisted_server_id" && "$persisted_server_id" == "$api_server_id" ]]; then
+    print_row 'Server ID' '✓ Stable'
+  else
+    print_row 'Server ID' '! Needs verification'
+  fi
+  if [[ "$(proxy_mode)" == 'caddy' ]]; then
+    if public_https_reachable; then print_row 'HTTPS' '✓'; else print_row 'HTTPS' '! Not verified'; fi
+  else
+    print_row 'HTTPS' '! External reverse proxy mode'
+  fi
+  print_row 'Public URL' "$(public_url)"
+  print_row 'Public Port' "$(public_port)"
+  if [[ "$cloud_multi_binding" == 'true' ]]; then print_row 'Cloud V3' '✓ Supported'; else print_row 'Cloud V3' '! Not reported'; fi
+}
+
+doctor_problems=0
+doctor_pass() {
+  printf '[✓] %s\n' "$1"
+}
+
+doctor_note() {
+  printf '[!] %s\n' "$1"
+}
+
+doctor_fail() {
+  printf '[✗] %s\n' "$1"
+  doctor_problems=$((doctor_problems + 1))
+}
+
+doctor_command() {
+  require_installation
+  doctor_problems=0
+  local fields=''
+  local gateway_state='unavailable'
+  local active_agents='0'
+  local api_server_id=''
+  local cloud_multi_binding='false'
+  local persisted_server_id=''
+  local detected_profiles=''
+  local cloud_url=''
+
+  if docker_ready; then doctor_pass 'Docker daemon and Docker Compose'; else doctor_fail 'Docker daemon or Docker Compose is unavailable'; fi
+  if docker_ready && service_running server; then doctor_pass 'Server container'; else doctor_fail 'Server container is not running'; fi
+  if local_health; then doctor_pass 'Server health'; else doctor_fail "Server health on 127.0.0.1:$bridge_port"; fi
+  if fields="$(server_info_fields 2>/dev/null)"; then
+    IFS=$'\t' read -r gateway_state active_agents api_server_id cloud_multi_binding <<< "$fields"
+    if [[ "$gateway_state" == 'unavailable' ]]; then doctor_fail 'Hermes Agent connectivity'; else doctor_pass "Hermes Agent connectivity ($gateway_state)"; fi
+  else
+    doctor_fail 'Server-info response'
+  fi
+
+  if [[ -d "$root_dir/data/server" ]] && probe="$(mktemp "$root_dir/data/server/.doctor.XXXXXX" 2>/dev/null)"; then
+    rm -f -- "$probe"
+    doctor_pass 'State directory writable'
+  else
+    doctor_fail 'State directory writable'
+  fi
+  persisted_server_id="$(identity_server_id 2>/dev/null || true)"
+  if [[ -n "$persisted_server_id" && "$persisted_server_id" == "$api_server_id" ]]; then
+    doctor_pass 'Server identity and serverId stability'
+  else
+    doctor_fail 'Server identity and serverId stability'
+  fi
+
+  if [[ -f "$root_dir/release-manifest.json" ]]; then
+    if python3 "$release_manifest_helper" verify \
+      --manifest "$root_dir/release-manifest.json" \
+      --version "$(env_get HERMES_LINK_VERSION)" \
+      --image-repository "$release_image_repository" >/dev/null 2>&1 && \
+      [[ "$(python3 "$release_manifest_helper" image --manifest "$root_dir/release-manifest.json" --version "$(env_get HERMES_LINK_VERSION)" --image-repository "$release_image_repository")" == "$(env_get HERMES_LINK_IMAGE)" ]]; then
+      doctor_pass 'Release manifest and immutable image digest'
+    else
+      doctor_fail 'Release manifest or immutable image digest'
+    fi
+  else
+    doctor_note 'Release manifest unavailable (reviewed local-source migration)'
+  fi
+
+  if detected_profiles="$(python3 "$helper" profiles --hermes-home "$(env_get HERMES_LINK_AGENT_HOME_HOST)" 2>/dev/null)"; then
+    local discovered_csv
+    discovered_csv="$(printf '%s\n' "$detected_profiles" | paste -sd, -)"
+    doctor_pass "Profiles detected ($(profile_count "$discovered_csv"))"
+    if [[ "$discovered_csv" == "$(configured_profiles)" ]]; then
+      doctor_pass "Profiles exposed ($(profile_count "$(configured_profiles)"))"
+    else
+      doctor_fail "Profiles exposed ($(profile_count "$(configured_profiles)") of $(profile_count "$discovered_csv"); run sudo hermes-link sync"
+    fi
+  else
+    doctor_fail 'Profiles detected'
+  fi
+
+  if [[ "$cloud_multi_binding" == 'true' ]]; then doctor_pass 'cloudMultiBinding capability'; else doctor_fail 'cloudMultiBinding capability'; fi
+  if [[ "$(proxy_mode)" == 'caddy' ]]; then
+    if service_running caddy; then doctor_pass 'Caddy container'; else doctor_fail 'Caddy container'; fi
+    if compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
+      doctor_pass 'Caddy configuration'
+    else
+      doctor_fail 'Caddy configuration'
+    fi
+  else
+    doctor_note "External reverse proxy mode; target: http://127.0.0.1:$bridge_port"
+  fi
+  if public_port_listening; then doctor_pass "Public port $(public_port) listener"; else doctor_fail "Public port $(public_port) listener"; fi
+  if public_https_reachable; then doctor_pass "HTTPS public URL $(public_url)"; else doctor_fail "HTTPS public URL $(public_url)"; fi
+
+  if [[ -f "$root_dir/data/server/cloud-config.json" ]]; then
+    cloud_url="$(python3 - "$root_dir/data/server/cloud-config.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    url = value.get("cloud_url", "") if isinstance(value, dict) else ""
+    if isinstance(url, str) and url.startswith("https://"):
+        print(url.rstrip("/"))
+except (OSError, ValueError, json.JSONDecodeError):
+    pass
+PY
+)"
+    cloud_status='000'
+    if [[ -n "$cloud_url" ]]; then
+      cloud_status="$(curl --silent --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 10 "$cloud_url/health" || true)"
+    fi
+    if [[ "$cloud_status" =~ ^[1-4][0-9][0-9]$ ]]; then doctor_pass 'Cloud connectivity'; else doctor_fail 'Cloud connectivity'; fi
+  else
+    doctor_note 'Cloud connectivity not configured (Cloud is optional)'
+  fi
+
+  if (( doctor_problems > 0 )); then
+    printf '\nDoctor found %s problem(s).\n' "$doctor_problems" >&2
+    return 1
+  fi
+}
+
+wait_for_local_health() {
+  local attempt
+  for attempt in {1..30}; do
+    if local_health; then return 0; fi
+    sleep 2
+  done
+  return 1
+}
+
+restart_command() {
+  require_installation
+  require_root
+  compose restart
+  if wait_for_local_health; then
+    printf 'Hermes Link Server restarted.\n'
+  else
+    fail 'Server did not become healthy after restart; run sudo hermes-link doctor.'
+  fi
+}
+
+logs_command() {
+  require_installation
+  local service="${1:-}"
+  if [[ -n "$service" && "$service" != 'server' && "$service" != 'log-exporter' && "$service" != 'caddy' ]]; then
+    fail 'logs accepts only server, log-exporter, or caddy'
+  fi
+  if [[ -n "$service" ]]; then compose logs --tail=200 "$service"; else compose logs --tail=200; fi
+}
+
+sync_command() {
+  require_installation
+  require_root
+  local profiles=''
+  profiles="$(python3 "$helper" profiles --hermes-home "$(env_get HERMES_LINK_AGENT_HOME_HOST)" | paste -sd, -)" || fail 'Unable to discover Hermes Profiles'
+  [[ -n "$profiles" ]] || fail 'No Hermes Profiles were discovered'
+  env_set HERMES_LINK_PROFILE_IDS "$profiles"
+  compose up -d --force-recreate server log-exporter
+  wait_for_local_health || fail 'Server did not become healthy after Profile synchronization'
+  printf 'Exposed Hermes Profiles: %s\n' "$profiles"
+}
+
+release_version() {
+  local value="${1#v}"
+  [[ "$value" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.]+)?$ ]] || return 1
+  printf '%s' "$value"
+}
+
+latest_release_version() {
+  local api_url
+  api_url="$(env_get HERMES_LINK_RELEASE_API_URL)"
+  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "$api_url" |
+    python3 -c 'import json, sys; value=json.load(sys.stdin).get("tag_name", ""); print(str(value).removeprefix("v"))'
+}
+
+release_download_base_url() {
+  local configured=''
+  configured="$(env_get HERMES_LINK_RELEASE_DOWNLOAD_BASE_URL 2>/dev/null || true)"
+  if [[ -z "$configured" ]]; then configured="$default_release_download_base_url"; fi
+  [[ "$configured" == https://* ]] || fail 'HERMES_LINK_RELEASE_DOWNLOAD_BASE_URL must use HTTPS'
+  printf '%s' "$configured"
+}
+
+download_release_manifest() {
+  local version="$1"
+  local destination="$2"
+  local base_url
+  base_url="$(release_download_base_url)"
+  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    "$base_url/v$version/release-manifest.json" -o "$destination"
+  python3 "$release_manifest_helper" verify \
+    --manifest "$destination" \
+    --version "$version" \
+    --image-repository "$release_image_repository"
+}
+
+download_release_asset() {
+  local version="$1"
+  local manifest="$2"
+  local relative_path="$3"
+  local destination="$4"
+  local base_url
+  base_url="$(env_get HERMES_LINK_RELEASE_BASE_URL)"
+  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    "$base_url/v$version/$relative_path" -o "$destination"
+  python3 "$release_manifest_helper" verify-file \
+    --manifest "$manifest" \
+    --version "$version" \
+    --image-repository "$release_image_repository" \
+    --path "$relative_path" \
+    --file "$destination"
+}
+
+backup_current_installation() {
+  local backup_dir="$1"
+  install -d -m 0700 "$backup_dir/config"
+  cp -a "$env_file" "$root_dir/compose.yaml" "$root_dir/Caddyfile" "$root_dir/.env.example" "$backup_dir/config/"
+  if [[ -f "$root_dir/release-manifest.json" ]]; then
+    cp -a "$root_dir/release-manifest.json" "$backup_dir/config/"
+  else
+    : > "$backup_dir/no-release-manifest"
+  fi
+  cp -a "$root_dir/bin" "$backup_dir/config/bin"
+  tar -czf "$backup_dir/server-state.tar.gz" -C "$root_dir/data" server
+}
+
+restore_backup() {
+  local backup_dir="$1"
+  printf 'Update failed; restoring the previous image, configuration, and Server state.\n' >&2
+  compose down --remove-orphans >/dev/null 2>&1 || true
+  cp -a "$backup_dir/config/." "$root_dir/"
+  if [[ -f "$backup_dir/no-release-manifest" ]]; then
+    rm -f -- "$root_dir/release-manifest.json"
+  fi
+  if [[ -d "$root_dir/data/server" ]]; then
+    mv "$root_dir/data/server" "$backup_dir/failed-server-state"
+  fi
+  tar -xzf "$backup_dir/server-state.tar.gz" -C "$root_dir/data"
+  compose up -d --remove-orphans >/dev/null
+  if wait_for_local_health; then
+    printf 'Rollback completed; the original Server identity was restored.\n' >&2
+  else
+    printf 'Rollback attempted but the restored Server is not healthy. Run sudo hermes-link doctor.\n' >&2
+  fi
+}
+
+verify_updated_runtime() {
+  local expected_server_id="$1"
+  local expected_profiles="$2"
+  local fields=''
+  local _gateway_state=''
+  local _active_agents=''
+  local actual_server_id=''
+  local cloud_multi_binding='false'
+  wait_for_local_health || return 1
+  fields="$(server_info_fields)" || return 1
+  IFS=$'\t' read -r _gateway_state _active_agents actual_server_id cloud_multi_binding <<< "$fields"
+  [[ "$actual_server_id" == "$expected_server_id" ]] || return 1
+  [[ "$(identity_server_id)" == "$expected_server_id" ]] || return 1
+  [[ "$(configured_profiles)" == "$expected_profiles" ]] || return 1
+  [[ "$cloud_multi_binding" == 'true' ]] || return 1
+  if [[ "$(proxy_mode)" == 'caddy' ]]; then public_https_reachable || return 1; fi
+}
+
+update_command() {
+  require_installation
+  require_root
+  local requested_version=''
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --version) requested_version="${2:-}"; shift 2 ;;
+      -h|--help) printf 'Usage: hermes-link update [--version VERSION]\n'; return 0 ;;
+      *) fail "Unknown update option: $1" ;;
+    esac
+  done
+  if [[ -z "$requested_version" ]]; then
+    requested_version="$(latest_release_version)" || fail 'Could not check the latest signed release; rerun with --version.'
+  fi
+  requested_version="$(release_version "$requested_version")" || fail '--version must be a pinned semantic version'
+  local current_version
+  current_version="$(env_get HERMES_LINK_VERSION)"
+  if [[ "$requested_version" == "$current_version" ]]; then
+    printf 'Hermes Link Server is already on %s.\n' "$current_version"
+    return 0
+  fi
+
+  local update_dir backup_dir old_server_id old_profiles new_image
+  update_dir="$(mktemp -d "$root_dir/.update.XXXXXX")"
+  backup_dir="$root_dir/backups/$(date -u +%Y%m%dT%H%M%SZ)-$current_version"
+  install -d -m 0700 "$backup_dir"
+  if ! {
+    download_release_manifest "$requested_version" "$update_dir/release-manifest.json"
+    download_release_asset "$requested_version" "$update_dir/release-manifest.json" 'deploy/standard/compose.yaml' "$update_dir/compose.yaml"
+    download_release_asset "$requested_version" "$update_dir/release-manifest.json" 'deploy/standard/Caddyfile' "$update_dir/Caddyfile"
+    download_release_asset "$requested_version" "$update_dir/release-manifest.json" 'deploy/standard/.env.example' "$update_dir/.env.example"
+    install -d -m 0755 "$update_dir/bin/lib"
+    download_release_asset "$requested_version" "$update_dir/release-manifest.json" 'deploy/standard/bin/hermes-link' "$update_dir/bin/hermes-link"
+    download_release_asset "$requested_version" "$update_dir/release-manifest.json" 'scripts/deployment_helpers.py' "$update_dir/bin/lib/deployment_helpers.py"
+    download_release_asset "$requested_version" "$update_dir/release-manifest.json" 'scripts/release_manifest.py' "$update_dir/bin/lib/release_manifest.py"
+    chmod 0755 "$update_dir/bin/hermes-link" "$update_dir/bin/lib/deployment_helpers.py" "$update_dir/bin/lib/release_manifest.py"
+    bash -n "$update_dir/bin/hermes-link"
+    python3 "$update_dir/bin/lib/release_manifest.py" verify \
+      --manifest "$update_dir/release-manifest.json" \
+      --version "$requested_version" \
+      --image-repository "$release_image_repository"
+  }; then
+    rm -rf -- "$update_dir"
+    fail "Could not download or validate release $requested_version"
+  fi
+
+  old_server_id="$(identity_server_id)" || fail 'Cannot back up an invalid Server identity'
+  old_profiles="$(configured_profiles)"
+  new_image="$(python3 "$release_manifest_helper" image \
+    --manifest "$update_dir/release-manifest.json" \
+    --version "$requested_version" \
+    --image-repository "$release_image_repository")" || {
+      rm -rf -- "$update_dir"
+      fail "Could not read the verified image digest for release $requested_version"
+    }
+  if ! compose stop; then
+    rm -rf -- "$update_dir"
+    fail 'Could not stop the managed runtime for a consistent state backup'
+  fi
+  if ! backup_current_installation "$backup_dir"; then
+    compose start >/dev/null 2>&1 || true
+    rm -rf -- "$update_dir"
+    fail 'Could not create a consistent update backup'
+  fi
+  cp -a "$update_dir/compose.yaml" "$update_dir/Caddyfile" "$update_dir/.env.example" "$update_dir/release-manifest.json" "$root_dir/"
+  cp -a "$update_dir/bin/." "$root_dir/bin/"
+  env_set HERMES_LINK_VERSION "$requested_version"
+  env_set HERMES_LINK_IMAGE "$new_image"
+
+  if ! compose pull || ! compose up -d --remove-orphans || ! verify_updated_runtime "$old_server_id" "$old_profiles"; then
+    restore_backup "$backup_dir"
+    rm -rf -- "$update_dir"
+    return 1
+  fi
+  rm -rf -- "$update_dir"
+  printf 'Hermes Link Server updated to %s. Server identity, Profiles, and public URL were retained.\n' "$requested_version"
+}
+
+uninstall_command() {
+  require_installation
+  require_root
+  local purge=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --purge) purge=true; shift ;;
+      -h|--help) printf 'Usage: hermes-link uninstall [--purge]\n'; return 0 ;;
+      *) fail "Unknown uninstall option: $1" ;;
+    esac
+  done
+  if [[ "$purge" == false ]]; then
+    compose down --remove-orphans
+    if [[ "$(readlink -f /usr/local/bin/hermes-link 2>/dev/null || true)" == "$root_dir/bin/hermes-link" ]]; then
+      rm -f -- /usr/local/bin/hermes-link
+    fi
+    printf 'Runtime stopped. Server identity, pairing, Cloud binding, certificates, and backups remain in %s.\n' "$root_dir"
+    if [[ "$(public_port)" != '443' ]]; then
+      printf 'No firewall rule is removed for custom public port %s; Hermes Link did not create one automatically.\n' "$(public_port)"
+    fi
+    printf 'To resume it, run %s/bin/hermes-link restart.\n' "$root_dir"
+    return 0
+  fi
+  [[ "$(basename -- "$root_dir")" == 'hermes-link' && "$root_dir" == /opt/* ]] || \
+    fail 'For safety, --purge supports only an installation rooted below /opt/hermes-link.'
+  printf 'This permanently removes Server identity, pairing, Cloud binding, certificates, and backups. Type DELETE to continue: ' >/dev/tty
+  local confirmation=''
+  IFS= read -r confirmation </dev/tty || true
+  [[ "$confirmation" == 'DELETE' ]] || fail 'Purge cancelled'
+  compose down --remove-orphans
+  if [[ "$(readlink -f /usr/local/bin/hermes-link 2>/dev/null || true)" == "$root_dir/bin/hermes-link" ]]; then
+    rm -f -- /usr/local/bin/hermes-link
+  fi
+  if [[ "$(env_get HERMES_LINK_FIREWALL_MANAGED)" == '1' ]]; then
+    printf 'A Hermes Link-managed firewall rule may exist for port %s; it was not removed automatically.\n' "$(public_port)"
+  elif [[ "$(public_port)" != '443' ]]; then
+    printf 'No firewall rule is removed for custom public port %s; Hermes Link did not create one automatically.\n' "$(public_port)"
+  fi
+  rm -rf -- "$root_dir"
+  printf 'Hermes Link Server and its persisted data were removed.\n'
+}
+
+command_name="${1:-}"
+if [[ -z "$command_name" || "$command_name" == '-h' || "$command_name" == '--help' ]]; then
+  usage
+  exit 0
+fi
+shift
+
+case "$command_name" in
+  status) [[ $# -eq 0 ]] || fail 'status takes no options'; status_command ;;
+  doctor) [[ $# -eq 0 ]] || fail 'doctor takes no options'; doctor_command ;;
+  restart) [[ $# -eq 0 ]] || fail 'restart takes no options'; restart_command ;;
+  logs) logs_command "$@" ;;
+  sync) [[ $# -eq 0 ]] || fail 'sync takes no options'; sync_command ;;
+  update) update_command "$@" ;;
+  uninstall) uninstall_command "$@" ;;
+  *) fail "Unknown command: $command_name" ;;
+esac

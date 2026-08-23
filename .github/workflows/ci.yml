@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -22,3 +24,36 @@ jobs:
         run: python scripts/architecture_gate.py
       - name: Secret scan
         run: python scripts/secret_scan.py
+      - name: Current-tree public release gate
+        run: python scripts/public_release_gate.py --current-only
+      - name: Standard installer and custom-port smoke test
+        run: |
+          bash -n install.sh
+          bash -n deploy/standard/bin/hermes-link
+          bash install.sh --dry-run --source-dir "$PWD" --domain hermes.example.com --public-port 18443 --proxy-mode external --agent-user runner --hermes-home /tmp/runner/.hermes
+      - name: Standard Compose validation
+        run: |
+          printf 'HERMES_LINK_MOBILE_API_TOKEN=example-internal-credential\n' > .ci-internal-agent.env
+          cp .env.example .ci-standard.env
+          sed -i "s|^HERMES_LINK_INTERNAL_ENV_FILE=.*|HERMES_LINK_INTERNAL_ENV_FILE=$PWD/.ci-internal-agent.env|" .ci-standard.env
+          docker compose --env-file .ci-standard.env -f deploy/standard/compose.yaml config
+          docker run --rm \
+            -e HERMES_LINK_PUBLIC_HOST=hermes.example.com \
+            -e HERMES_LINK_PUBLIC_PORT=18443 \
+            -v "$PWD/deploy/standard/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2.8-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      - name: Docker image smoke test
+        run: |
+          docker build --file deploy/docker/Dockerfile --tag hermes-link-server:ci .
+          docker run --rm --network host -e HERMES_LINK_BRIDGE_PORT=18765 hermes-link-server:ci sh -ec '
+            python -m hermes_link.integrations.hermes_agent.bridge &
+            child=$!
+            trap "kill $child" EXIT
+            for attempt in $(seq 1 15); do
+              if python -c "from urllib.request import urlopen; assert urlopen(\"http://127.0.0.1:18765/health\", timeout=2).status == 200"; then
+                exit 0
+              fi
+              sleep 1
+            done
+            exit 1
+          '

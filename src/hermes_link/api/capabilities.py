@@ -17,6 +17,7 @@ DEFAULT_FEATURES: dict[str, bool] = {
     "executionTrace": True,
     "directNotifications": True,
     "cloudNotifications": True,
+    "cloudMultiBinding": False,
 }
 
 
@@ -25,6 +26,7 @@ def server_info(
     *,
     features: Mapping[str, bool] | None = None,
     runtime: Mapping[str, object] | None = None,
+    server_id: str | None = None,
 ) -> dict[str, object]:
     resolved = dict(DEFAULT_FEATURES)
     if features:
@@ -50,4 +52,6 @@ def server_info(
             else 0
         )
         payload["gateway_busy"] = bool(runtime.get("gateway_busy", False))
+    if server_id:
+        payload["serverId"] = str(server_id)
     return payload

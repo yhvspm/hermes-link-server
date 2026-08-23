@@ -36,12 +36,15 @@ class PublicContractTests(unittest.TestCase):
         server_schema = _read_schema("server-info-v1.schema.json")
         event_schema = _read_schema("event-v1.schema.json")
         cloud_schema = _read_schema("cloud-v2-event-request.schema.json")
+        provision_schema = _read_schema("cloud-v3-provision-request.schema.json")
         self.assertEqual(server_schema["properties"]["protocolVersion"]["const"], 1)
         self.assertEqual(event_schema["$id"], "urn:hermes-link:event:v1")
         self.assertEqual(cloud_schema["$id"], "urn:hermes-link:cloud:v2:event-request")
+        self.assertEqual(provision_schema["$id"], "urn:hermes-link:cloud:v3:provision-request")
         self.assertFalse(server_schema["additionalProperties"])
         self.assertFalse(event_schema["additionalProperties"])
         self.assertFalse(cloud_schema["additionalProperties"])
+        self.assertFalse(provision_schema["additionalProperties"])
 
     def test_server_info_matches_app_capability_contract(self) -> None:
         payload = server_info(
@@ -82,6 +85,7 @@ class PublicContractTests(unittest.TestCase):
                 "executionTrace",
                 "directNotifications",
                 "cloudNotifications",
+                "cloudMultiBinding",
             },
         )
         self.assertTrue(all(isinstance(value, bool) for value in features.values()))
@@ -132,7 +136,7 @@ class PublicContractTests(unittest.TestCase):
         with patch("hermes_link.notifications.cloud_sender.urlopen", return_value=Response()) as mocked:
             result = CloudEventSender(
                 "https://cloud.example.test/hermes-link-cloud",
-                "server_contract_1",
+                "server_" + "a" * 32,
                 _private_key_pem(),
             ).publish(event, "installation_1")
 
@@ -143,7 +147,8 @@ class PublicContractTests(unittest.TestCase):
         self.assertEqual(request.method, "POST")
         self.assertEqual(request.full_url, "https://cloud.example.test/hermes-link-cloud/v1/events")
         self.assertEqual(body["installation_id"], "installation_1")
-        self.assertEqual(body["schema_version"], 1)
+        self.assertEqual(body["schema_version"], 2)
+        self.assertEqual(body["server_id"], "server_" + "a" * 32)
         self.assertEqual(body["event_id"], event["event_id"])
         self.assertEqual(body["event_type"], event["event_type"])
         self.assertEqual(body["profile_id"], event["profile_id"])
@@ -155,11 +160,13 @@ class PublicContractTests(unittest.TestCase):
             "event_type": event["event_type"],
             "event_id": event["event_id"],
             "profile_id": event["profile_id"],
+            "server_id": "server_" + "a" * 32,
             "session_id": event["session_id"],
             "job_id": event["job_id"],
         })
         self.assertEqual(set(body), {
             "schema_version",
+            "server_id",
             "event_id",
             "event_type",
             "profile_id",

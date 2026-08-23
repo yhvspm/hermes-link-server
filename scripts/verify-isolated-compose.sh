@@ -54,6 +54,7 @@ if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>
 fi
 
 export HERMES_LINK_SERVER_ENV_FILE="$server_env"
+export HERMES_LINK_INTERNAL_ENV_FILE="${HERMES_LINK_INTERNAL_ENV_FILE:-$server_env}"
 export HERMES_HOME_HOST_PATH="$hermes_home"
 export HERMES_LINK_PUBLIC_HOST='compose-validation.example.invalid'
 export HERMES_LINK_LISTEN_PORT='18443'
@@ -77,7 +78,7 @@ curl --fail --silent "http://127.0.0.1:${bridge_port}/health" >/dev/null
 curl --fail --silent "http://127.0.0.1:${bridge_port}/hermes-link/v1/server-info" |
   python3 -c "import json,sys; value=json.load(sys.stdin); assert value['protocolVersion'] == 1; print('server-info: protocol-v1')"
 
-pairing_code=$("${compose[@]}" exec -T server python -c "from hermes_link.pairing.store import create_pairing_ticket; import os; url=create_pairing_ticket('https://compose-validation.example.invalid:18443', os.environ['HERMES_LINK_MOBILE_API_TOKEN'], path=os.environ['HERMES_LINK_PAIRING_DB'])['pairing_url']; print(url.split('code=', 1)[1].split('&', 1)[0])")
+pairing_code=$("${compose[@]}" exec -T server python -c "from hermes_link.pairing.store import create_pairing_ticket; import os; token=(os.environ.get('HERMES_LINK_MOBILE_API_TOKEN') or os.environ.get('HERMES_LINK_AGENT_TOKEN') or '').strip(); assert token, 'Missing Server-to-Agent credential'; url=create_pairing_ticket('https://compose-validation.example.invalid:18443', token, path=os.environ['HERMES_LINK_PAIRING_DB'])['pairing_url']; print(url.split('code=', 1)[1].split('&', 1)[0])")
 pairing_response=$(curl --fail --silent -X POST "http://127.0.0.1:${bridge_port}/hermes-link/v1/pairing" \
   -H 'Content-Type: application/json' \
   --data "{\"schema_version\":1,\"code\":\"${pairing_code}\"}")

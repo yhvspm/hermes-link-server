@@ -13,6 +13,7 @@ import os
 import re
 import secrets
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlparse
@@ -27,6 +28,9 @@ except ImportError:  # pragma: no cover - deployment configuration failure
 
 SERVER_ID_PATTERN = re.compile(r"^server_[A-Za-z0-9]{32}$")
 INSTALLATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+PROFILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+ATTESTATION_NONCE_PATTERN = re.compile(r"^att_[A-Za-z0-9_-]{24,128}$")
+ATTESTATION_TTL_SECONDS = 300
 
 
 def _base64url(value: bytes) -> str:
@@ -50,6 +54,64 @@ def _validate_public_key(value: str) -> str:
     if len(decoded) != 32:
         raise ValueError("server public key is invalid")
     return public_key
+
+
+def _validate_cloud_url(value: object) -> str:
+    cloud_url = str(value or "").strip().rstrip("/")
+    parsed = urlparse(cloud_url)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("cloud_url must be an HTTPS origin without credentials or query data")
+    return cloud_url
+
+
+def _validate_installation_id(value: object) -> str:
+    installation_id = str(value or "").strip()
+    if not INSTALLATION_ID_PATTERN.fullmatch(installation_id):
+        raise ValueError("installation_id is invalid")
+    return installation_id
+
+
+def _normalize_profiles(values: object) -> list[str]:
+    if not isinstance(values, list):
+        raise ValueError("profiles must be an array")
+    profiles: list[str] = []
+    for value in values:
+        profile_id = str(value or "").strip()
+        if not PROFILE_ID_PATTERN.fullmatch(profile_id):
+            raise ValueError("profile_id is invalid")
+        if profile_id not in profiles:
+            profiles.append(profile_id)
+    if not profiles:
+        raise ValueError("at least one profile is required")
+    return profiles
+
+
+def _canonical_json(payload: Mapping[str, Any]) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _sign_attestation(private_key_pem: str, payload: Mapping[str, Any]) -> str:
+    if serialization is None:
+        raise RuntimeError("Cloud V2 identity requires cryptography")
+    private_key = serialization.load_pem_private_key(
+        private_key_pem.encode("utf-8"),
+        password=None,
+    )
+    if not isinstance(private_key, Ed25519PrivateKey):
+        raise ValueError("Cloud attestation key must be Ed25519")
+    return "ed25519:" + _base64url(private_key.sign(_canonical_json(payload)))
 
 
 def _identity_path() -> Path:
@@ -138,20 +200,8 @@ def public_identity() -> dict[str, str]:
 
 
 def configure_cloud(payload: Mapping[str, Any]) -> dict[str, Any]:
-    cloud_url = str(payload.get("cloud_url", "")).strip().rstrip("/")
-    parsed = urlparse(cloud_url)
-    if (
-        parsed.scheme != "https"
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError("cloud_url must be an HTTPS origin without credentials or query data")
-    installation_id = str(payload.get("installation_id", "")).strip()
-    if not INSTALLATION_ID_PATTERN.fullmatch(installation_id):
-        raise ValueError("installation_id is invalid")
+    cloud_url = _validate_cloud_url(payload.get("cloud_url"))
+    installation_id = _validate_installation_id(payload.get("installation_id"))
     identity = get_or_create_identity()
     requested_server_id = str(payload.get("server_id", identity["server_id"]))
     server_id = _validate_server_id(requested_server_id)
@@ -173,6 +223,56 @@ def configure_cloud(payload: Mapping[str, Any]) -> dict[str, Any]:
         "installation_id": installation_id,
         "server_id": server_id,
     }
+
+
+def create_cloud_binding_attestation(
+    payload: Mapping[str, Any],
+    profiles: list[str],
+    *,
+    now: int | None = None,
+) -> dict[str, Any]:
+    """Sign a short-lived, scoped Cloud binding assertion for one device.
+
+    The caller supplies only the target Cloud URL and device installation id.
+    The Server derives the Profile allowlist from the authenticated device
+    token, signs the complete assertion, and never returns its private key.
+    """
+
+    if int(payload.get("schema_version", 0)) != 1:
+        raise ValueError("Cloud attestation schema_version is unsupported")
+    cloud_url = _validate_cloud_url(payload.get("cloud_url"))
+    installation_id = _validate_installation_id(payload.get("installation_id"))
+    normalized_profiles = _normalize_profiles(profiles)
+    issued_at = int(time.time() if now is None else now)
+    identity = get_or_create_identity()
+    attestation = {
+        "schema_version": 1,
+        "server_id": identity["server_id"],
+        "public_key": identity["public_key"],
+        "installation_id": installation_id,
+        "cloud_url": cloud_url,
+        "profiles": normalized_profiles,
+        "issued_at": issued_at,
+        "expires_at": issued_at + ATTESTATION_TTL_SECONDS,
+        "nonce": f"att_{secrets.token_urlsafe(24)}",
+    }
+    if not ATTESTATION_NONCE_PATTERN.fullmatch(str(attestation["nonce"])):
+        raise RuntimeError("Cloud attestation nonce generation failed")
+    return {
+        "schema_version": 1,
+        "attestation": attestation,
+        "attestation_signature": _sign_attestation(identity["private_key_pem"], attestation),
+    }
+
+
+def clear_cloud_config() -> dict[str, bool]:
+    """Remove only this Server's optional Cloud delivery configuration."""
+
+    try:
+        _config_path().unlink()
+    except FileNotFoundError:
+        pass
+    return {"ok": True}
 
 
 def load_cloud_config() -> dict[str, str]:

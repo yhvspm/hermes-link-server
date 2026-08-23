@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 EXCLUDED = {".git", ".hvigor", ".test", "build", "dist", "node_modules", "oh_modules", "__pycache__"}
 TEXT_SUFFIXES = {
-    "", ".py", ".ets", ".ts", ".js", ".json", ".json5", ".md", ".yml", ".yaml",
+    "", ".py", ".sh", ".ets", ".ts", ".js", ".json", ".json5", ".md", ".yml", ".yaml",
     ".toml", ".txt", ".service", ".conf", ".example", ".patch", ".properties",
 }
 PRIVATE_KEY = re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")
@@ -58,4 +58,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

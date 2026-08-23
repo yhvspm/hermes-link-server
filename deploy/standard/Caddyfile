@@ -1,0 +1,14 @@
+{$HERMES_LINK_PUBLIC_HOST}:{$HERMES_LINK_PUBLIC_PORT} {
+    encode zstd gzip
+
+    @hermes_link path /hermes-link/v1/*
+    reverse_proxy @hermes_link 127.0.0.1:${HERMES_LINK_BRIDGE_PORT} {
+        flush_interval -1
+    }
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+    }
+}

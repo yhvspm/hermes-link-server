@@ -70,12 +70,14 @@ class CloudEventSender:
             "event_type": event_type,
             "event_id": str(event["event_id"]),
             "profile_id": str(event["profile_id"]),
+            "server_id": self.server_id,
         }
         for name in ("session_id", "job_id"):
             if str(event.get(name, "")):
                 data[name] = str(event[name])
         cloud_event: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "server_id": self.server_id,
             "event_id": str(event["event_id"]),
             "event_type": event_type,
             "profile_id": str(event["profile_id"]),

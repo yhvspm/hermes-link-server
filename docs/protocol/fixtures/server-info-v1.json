@@ -14,6 +14,7 @@
     "pairing": true,
     "executionTrace": true,
     "directNotifications": true,
-    "cloudNotifications": true
+    "cloudNotifications": true,
+    "cloudMultiBinding": false
   }
 }

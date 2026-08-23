@@ -9,7 +9,9 @@ The default V2 client flow automatically creates a Cloud Account, Installation, 
 ## Event submission
 
 `POST /v1/events` carries a Cloud Protocol v2 notification envelope derived
-from Event Protocol v1 plus `installation_id`. The envelope contains only
+from Event Protocol v1 plus `installation_id`. The legacy input envelope is
+`schema_version: 1`; the multi-Hermes extension uses `schema_version: 2` with
+the same verified `server_id` at the root and in `data`. The envelope contains only
 generic notification metadata (`title`, `body`, and controlled `data` IDs);
 it never carries the chat text, Prompt, Agent response or credentials.
 
@@ -21,6 +23,11 @@ Required headers:
 - `X-Hermes-Link-Signature: ed25519:<base64url>`
 
 The signature covers uppercase method, exact path, timestamp, nonce and SHA-256 body hash separated by newlines. Cloud validates timestamp skew, consumes nonce once, verifies Server/Installation binding and entitlement, and deduplicates the event.
+
+Cloud Protocol v3 adds Server-issued, short-lived attestations for associating
+multiple Hermes Servers with one App Installation. It is an additive extension:
+single-Server V2 provisioning and schema v1 event input remain compatible.
+The authoritative contract is [`cloud-v3-multi-hermes.md`](cloud-v3-multi-hermes.md).
 
 ## Data minimization
 

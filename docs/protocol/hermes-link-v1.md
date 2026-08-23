@@ -16,6 +16,7 @@ The App communicates with Hermes Link Server, never Hermes Agent internals. All 
   "gateway_state": "ready",
   "active_agents": 0,
   "gateway_busy": false,
+  "serverId": "server_0123456789abcdef0123456789abcdef",
   "features": {
     "chat": true,
     "sessions": true,
@@ -24,7 +25,8 @@ The App communicates with Hermes Link Server, never Hermes Agent internals. All 
     "cron": true,
     "pairing": true,
     "directNotifications": true,
-    "cloudNotifications": true
+    "cloudNotifications": true,
+    "cloudMultiBinding": true
   }
 }
 ```
@@ -37,6 +39,13 @@ compatibility adapter and exposes no Agent internal fields, credentials, URLs,
 or process details. If the adapter cannot obtain the snapshot,
 `gateway_state` is `unavailable` and `active_agents` is `0`; clients must not
 treat that fallback as an Agent version or feature decision.
+
+`serverId` is the optional, immutable Hermes Server identity used only by the
+Cloud multi-Hermes contract. It is present only when the Server can access its
+local Ed25519 identity. `features.cloudMultiBinding` is true only in that
+case; clients must retain their Direct/single-Server fallback otherwise. See
+[`cloud-v3-multi-hermes.md`](cloud-v3-multi-hermes.md) for the scoped binding
+and event contract.
 
 ## Stable resource families
 

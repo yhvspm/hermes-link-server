@@ -12,6 +12,7 @@
     "gateway_state": {"type": "string", "minLength": 1},
     "active_agents": {"type": "integer", "minimum": 0},
     "gateway_busy": {"type": "boolean"},
+    "serverId": {"type": "string", "pattern": "^server_[A-Za-z0-9]{32}$"},
     "features": {
       "type": "object",
       "additionalProperties": false,
@@ -24,7 +25,8 @@
         "pairing",
         "executionTrace",
         "directNotifications",
-        "cloudNotifications"
+        "cloudNotifications",
+        "cloudMultiBinding"
       ],
       "properties": {
         "chat": {"type": "boolean"},
@@ -35,7 +37,8 @@
         "pairing": {"type": "boolean"},
         "executionTrace": {"type": "boolean"},
         "directNotifications": {"type": "boolean"},
-        "cloudNotifications": {"type": "boolean"}
+        "cloudNotifications": {"type": "boolean"},
+        "cloudMultiBinding": {"type": "boolean"}
       }
     }
   }

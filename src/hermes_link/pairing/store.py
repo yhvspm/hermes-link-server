@@ -253,11 +253,12 @@ class PairingStore:
         finally:
             connection.close()
 
-    def authenticate_device_token(self, token: str, profile_id: str = "default") -> bool:
+    def device_profile_ids(self, token: str) -> list[str] | None:
+        """Return the authenticated device scope; an empty list means all Profiles."""
+
         normalized = str(token or "").strip()
         if not DEVICE_TOKEN_PATTERN.fullmatch(normalized):
-            return False
-        current_profile = str(profile_id or "default").strip() or "default"
+            return None
         now = int(time.time())
         connection = _connect(self.path)
         try:
@@ -267,21 +268,26 @@ class PairingStore:
                 (_token_hash(normalized),),
             ).fetchone()
             if row is None:
-                return False
+                return None
             try:
                 profiles = _normalize_profiles(json.loads(str(row["profiles_json"])))
             except (TypeError, ValueError):
                 profiles = []
-            if profiles and current_profile not in profiles:
-                return False
             connection.execute(
                 "UPDATE pairing_devices SET last_used_at = ? WHERE device_id = ?",
                 (now, str(row["device_id"])),
             )
             connection.commit()
-            return True
+            return profiles
         finally:
             connection.close()
+
+    def authenticate_device_token(self, token: str, profile_id: str = "default") -> bool:
+        profiles = self.device_profile_ids(token)
+        if profiles is None:
+            return False
+        current_profile = str(profile_id or "default").strip() or "default"
+        return not profiles or current_profile in profiles
 
     def revoke_device_token(self, token: str) -> bool:
         normalized = str(token or "").strip()
@@ -327,6 +333,10 @@ def exchange_pairing_code(code: str, *, path: Path | str | None = None) -> dict[
 
 def authenticate_device_token(token: str, profile_id: str = "default", *, path: Path | str | None = None) -> bool:
     return PairingStore(path).authenticate_device_token(token, profile_id)
+
+
+def device_profile_ids(token: str, *, path: Path | str | None = None) -> list[str] | None:
+    return PairingStore(path).device_profile_ids(token)
 
 
 def revoke_device_token(token: str, *, path: Path | str | None = None) -> bool:

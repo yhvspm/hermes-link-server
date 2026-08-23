@@ -4,20 +4,37 @@
   "title": "Hermes Link Cloud Protocol v2 Notification Event Request",
   "type": "object",
   "additionalProperties": false,
-  "oneOf": [
+  "allOf": [
     {
-      "required": ["event_id", "event_type", "profile_id", "dedupe_key", "session_id"],
-      "properties": {
-        "event_type": {"const": "chat.completed"},
-        "session_id": {"$ref": "#/$defs/identifier"}
-      }
+      "oneOf": [
+        {
+          "required": ["event_id", "event_type", "profile_id", "dedupe_key", "session_id"],
+          "properties": {
+            "event_type": {"const": "chat.completed"},
+            "session_id": {"$ref": "#/$defs/identifier"}
+          }
+        },
+        {
+          "required": ["event_id", "event_type", "profile_id", "dedupe_key", "job_id", "run_id"],
+          "properties": {
+            "event_type": {"enum": ["job.completed", "job.failed"]},
+            "job_id": {"$ref": "#/$defs/identifier"},
+            "session_id": {"$ref": "#/$defs/identifier"}
+          }
+        }
+      ]
     },
     {
-      "required": ["event_id", "event_type", "profile_id", "dedupe_key", "job_id", "run_id"],
-      "properties": {
-        "event_type": {"enum": ["job.completed", "job.failed"]},
-        "job_id": {"$ref": "#/$defs/identifier"},
-        "session_id": {"$ref": "#/$defs/identifier"}
+      "if": {
+        "properties": {"schema_version": {"const": 2}}
+      },
+      "then": {
+        "required": ["server_id"],
+        "properties": {"data": {"$ref": "#/$defs/scopedData"}}
+      },
+      "else": {
+        "not": {"required": ["server_id"]},
+        "properties": {"data": {"$ref": "#/$defs/legacyData"}}
       }
     }
   ],
@@ -34,7 +51,8 @@
     "installation_id"
   ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"enum": [1, 2]},
+    "server_id": {"$ref": "#/$defs/serverId"},
     "event_id": {"$ref": "#/$defs/identifier"},
     "event_type": {"enum": ["chat.completed", "job.completed", "job.failed"]},
     "profile_id": {"$ref": "#/$defs/identifier"},
@@ -45,7 +63,22 @@
     "occurred_at": {"type": "string", "minLength": 1, "maxLength": 64},
     "title": {"type": "string", "minLength": 1, "maxLength": 80},
     "body": {"type": "string", "minLength": 1, "maxLength": 240},
-    "data": {
+    "data": {"type": "object"},
+    "installation_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,160}$"
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,160}$"
+    },
+    "serverId": {
+      "type": "string",
+      "pattern": "^server_[A-Za-z0-9]{32}$"
+    },
+    "legacyData": {
       "type": "object",
       "additionalProperties": false,
       "required": ["event_type", "event_id", "profile_id"],
@@ -57,15 +90,18 @@
         "job_id": {"$ref": "#/$defs/identifier"}
       }
     },
-    "installation_id": {
-      "type": "string",
-      "pattern": "^[A-Za-z0-9._:-]{1,160}$"
-    }
-  },
-  "$defs": {
-    "identifier": {
-      "type": "string",
-      "pattern": "^[A-Za-z0-9._:-]{1,160}$"
+    "scopedData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_type", "event_id", "profile_id", "server_id"],
+      "properties": {
+        "event_type": {"enum": ["chat.completed", "job.completed", "job.failed"]},
+        "event_id": {"$ref": "#/$defs/identifier"},
+        "profile_id": {"$ref": "#/$defs/identifier"},
+        "server_id": {"$ref": "#/$defs/serverId"},
+        "session_id": {"$ref": "#/$defs/identifier"},
+        "job_id": {"$ref": "#/$defs/identifier"}
+      }
     }
   }
 }

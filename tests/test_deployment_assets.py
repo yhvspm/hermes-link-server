@@ -120,6 +120,11 @@ class DeploymentAssetTests(unittest.TestCase):
         self.assertIn('"--qr"', source)
         self.assertIn("HERMES_LINK_MOBILE_API_TOKEN", source)
 
+    def test_isolated_verifier_uses_the_runtime_credential_fallback(self) -> None:
+        source = (ROOT / "scripts/verify-isolated-compose.sh").read_text(encoding="utf-8")
+        self.assertIn('HERMES_LINK_INTERNAL_ENV_FILE="${HERMES_LINK_INTERNAL_ENV_FILE:-$server_env}"', source)
+        self.assertIn("HERMES_LINK_MOBILE_API_TOKEN') or os.environ.get('HERMES_LINK_AGENT_TOKEN", source)
+
     def test_internal_credential_manager_creates_root_only_file_without_printing_value(self) -> None:
         import tempfile
 
