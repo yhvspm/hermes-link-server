@@ -5,9 +5,8 @@ umask 077
 # This is the supported entry point for the standard Docker runtime. It is
 # intentionally independent from the older development/validation Compose
 # assets under deploy/docker.
-DEFAULT_VERSION='1.0.0'
+DEFAULT_VERSION='1.0.1'
 DEFAULT_IMAGE_REPOSITORY='ghcr.io/yhvspm/hermes-link-server'
-DEFAULT_RELEASE_BASE_URL='https://raw.githubusercontent.com/yhvspm/hermes-link-server'
 DEFAULT_RELEASE_DOWNLOAD_BASE_URL='https://github.com/yhvspm/hermes-link-server/releases/download'
 INSTALL_DIR='/opt/hermes-link'
 INTERNAL_CREDENTIAL_FILE='/etc/hermes-link-server/internal-agent.env'
@@ -15,7 +14,8 @@ INTERNAL_BRIDGE_PORT='18765'
 
 usage() {
   cat <<'EOF'
-Usage: curl -fsSL https://raw.githubusercontent.com/yhvspm/hermes-link-server/v1.0.0/install.sh | sudo bash
+Usage: curl -fL https://github.com/yhvspm/hermes-link-server/releases/download/v1.0.1/hermes-link-server-install.sh -o hermes-link-server-install.sh
+       sudo bash hermes-link-server-install.sh
 
 Or from a reviewed release tree:
   sudo bash ./install.sh [options]
@@ -29,9 +29,10 @@ Options:
   --agent-user USER            Hermes Agent operating-system user
   --hermes-home PATH           Hermes metadata directory
   --image IMAGE                Advanced local-source image override
-  --version VERSION            Pinned release version (default: 1.0.0)
+  --version VERSION            Pinned release version (default: 1.0.1)
   --source-dir PATH            Use local release assets instead of downloading them
   --install-dir PATH           Installation directory (default: /opt/hermes-link)
+  --upgrade-existing           Bootstrap a managed installation into this pinned release
   --reuse-agent-credential PATH
                                Advanced migration: reuse a root-only Agent credential
   --state-import-dir PATH      Advanced migration: import existing Server identity and pairing state
@@ -70,10 +71,11 @@ state_import_dir=''
 state_identity_source=''
 state_cloud_source=''
 skip_image_pull=false
+image_loaded_from_archive=false
+upgrade_existing=false
 internal_bridge_port="$INTERNAL_BRIDGE_PORT"
 dry_run=false
 non_interactive=false
-release_base_url="${HERMES_LINK_RELEASE_BASE_URL:-$DEFAULT_RELEASE_BASE_URL}"
 release_download_base_url="${HERMES_LINK_RELEASE_DOWNLOAD_BASE_URL:-$DEFAULT_RELEASE_DOWNLOAD_BASE_URL}"
 python_bin="${HERMES_LINK_PYTHON:-python3}"
 
@@ -93,6 +95,7 @@ while [[ $# -gt 0 ]]; do
     --reuse-agent-credential) reuse_agent_credential="${2:-}"; shift 2 ;;
     --state-import-dir) state_import_dir="${2:-}"; shift 2 ;;
     --skip-image-pull) skip_image_pull=true; shift ;;
+    --upgrade-existing) upgrade_existing=true; shift ;;
     --non-interactive) non_interactive=true; shift ;;
     --dry-run) dry_run=true; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -122,9 +125,6 @@ if [[ ! "$agent_service" =~ ^[A-Za-z0-9_.@-]+\.service$ ]]; then
 fi
 if [[ "$agent_service_scope" != 'system' && "$agent_service_scope" != 'user' ]]; then
   fail "--agent-service-scope must be system or user"
-fi
-if [[ "$release_base_url" != https://* ]]; then
-  fail "HERMES_LINK_RELEASE_BASE_URL must use HTTPS"
 fi
 if [[ "$release_download_base_url" != https://* ]]; then
   fail "HERMES_LINK_RELEASE_DOWNLOAD_BASE_URL must use HTTPS"
@@ -188,11 +188,17 @@ initial_install_exists() {
   [[ -f "$install_dir/.env" && -x "$install_dir/bin/hermes-link" ]]
 }
 
-if [[ "$dry_run" == false && $(id -u) -eq 0 ]] && initial_install_exists; then
-  note "An existing Hermes Link installation was found at $install_dir."
-  note "Its identity and configuration were left unchanged."
-  "$install_dir/bin/hermes-link" status || true
-  exit 0
+existing_install=false
+if initial_install_exists; then
+  existing_install=true
+  if [[ "$upgrade_existing" == false && "$dry_run" == false && $(id -u) -eq 0 ]]; then
+    note "An existing Hermes Link installation was found at $install_dir."
+    note "Its identity and configuration were left unchanged. Use --upgrade-existing to migrate it."
+    "$install_dir/bin/hermes-link" status || true
+    exit 0
+  fi
+elif [[ "$upgrade_existing" == true ]]; then
+  fail "--upgrade-existing requires a managed Hermes Link installation at $install_dir"
 fi
 
 ensure_ubuntu_prerequisites
@@ -217,14 +223,14 @@ release_manifest=''
 
 release_manifest_value() {
   local requested_path="${1:-}"
-  "$python_bin" - "$release_manifest" "$version" "$DEFAULT_IMAGE_REPOSITORY" "$requested_path" <<'PY'
-import hashlib
+  local requested_value="${2:-image}"
+  "$python_bin" - "$release_manifest" "$version" "$DEFAULT_IMAGE_REPOSITORY" "$requested_path" "$requested_value" <<'PY'
 import json
 import re
 import sys
 from pathlib import Path
 
-manifest_path, expected_version, image_repository, requested_path = sys.argv[1:]
+manifest_path, expected_version, image_repository, requested_path, requested_value = sys.argv[1:]
 release_paths = {
     "install.sh",
     "deploy/standard/compose.yaml",
@@ -236,15 +242,23 @@ release_paths = {
     "scripts/manage-internal-credential.py",
     "scripts/release_manifest.py",
 }
+archive_name = f"hermes-link-server-{expected_version}-linux-amd64.oci.tar"
 try:
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
 except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
     raise SystemExit(f"Cannot read release manifest: {error}")
 
-if set(manifest) != {"schema_version", "version", "source_commit", "image", "files"}:
-    raise SystemExit("Release manifest has unexpected or missing fields")
-if manifest["schema_version"] != 1:
+schema_version = manifest.get("schema_version")
+if type(schema_version) is not int:
     raise SystemExit("Release manifest schema is unsupported")
+if schema_version == 1:
+    expected_keys = {"schema_version", "version", "source_commit", "image", "files"}
+elif schema_version == 2:
+    expected_keys = {"schema_version", "version", "source_commit", "image", "image_archive", "files"}
+else:
+    raise SystemExit("Release manifest schema is unsupported")
+if set(manifest) != expected_keys:
+    raise SystemExit("Release manifest has unexpected or missing fields")
 if manifest["version"] != expected_version or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[.-][A-Za-z0-9.]+)?", manifest["version"]) is None:
     raise SystemExit("Release manifest version does not match the requested version")
 if not isinstance(manifest["source_commit"], str) or re.fullmatch(r"[0-9a-f]{40}", manifest["source_commit"]) is None:
@@ -258,10 +272,22 @@ if not isinstance(files, dict) or set(files) != release_paths:
     raise SystemExit("Release manifest assets are incomplete or unexpected")
 if any(not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None for value in files.values()):
     raise SystemExit("Release manifest contains an invalid asset digest")
+if schema_version == 2:
+    image_archive = manifest["image_archive"]
+    if not isinstance(image_archive, dict) or set(image_archive) != {"name", "sha256", "platform"}:
+        raise SystemExit("Release manifest image archive is invalid")
+    if image_archive.get("name") != archive_name or image_archive.get("platform") != "linux/amd64":
+        raise SystemExit("Release manifest image archive is unsupported")
+    if not isinstance(image_archive.get("sha256"), str) or re.fullmatch(r"[0-9a-f]{64}", image_archive["sha256"]) is None:
+        raise SystemExit("Release manifest image archive digest is invalid")
 if requested_path:
     if requested_path not in release_paths:
         raise SystemExit("Release asset is not in the supported manifest")
     print(files[requested_path])
+elif requested_value == "image-archive-name":
+    if schema_version != 2:
+        raise SystemExit("Release manifest does not contain an OCI image archive")
+    print(manifest["image_archive"]["name"])
 else:
     print(manifest["image"])
 PY
@@ -275,6 +301,21 @@ verify_release_asset() {
   expected="$(release_manifest_value "$relative_path")" || fail "Release manifest validation failed"
   actual="$(sha256sum -- "$asset_path" | awk '{print $1}')"
   [[ "$actual" == "$expected" ]] || fail "Release asset integrity verification failed: $relative_path"
+}
+
+release_asset_name() {
+  case "$1" in
+    install.sh) printf '%s' 'hermes-link-server-install.sh' ;;
+    deploy/standard/compose.yaml) printf '%s' 'hermes-link-server-compose.yaml' ;;
+    deploy/standard/Caddyfile) printf '%s' 'hermes-link-server-Caddyfile' ;;
+    deploy/standard/.env.example) printf '%s' 'hermes-link-server-env.example' ;;
+    deploy/standard/bin/hermes-link) printf '%s' 'hermes-link-server-cli' ;;
+    scripts/deployment_helpers.py) printf '%s' 'hermes-link-server-deployment-helpers.py' ;;
+    scripts/bootstrap-hermes-agent-access.sh) printf '%s' 'hermes-link-server-bootstrap-agent-access.sh' ;;
+    scripts/manage-internal-credential.py) printf '%s' 'hermes-link-server-manage-internal-credential.py' ;;
+    scripts/release_manifest.py) printf '%s' 'hermes-link-server-release-manifest.py' ;;
+    *) fail "Unknown release asset path: $1" ;;
+  esac
 }
 
 prepare_release_manifest() {
@@ -324,9 +365,11 @@ copy_asset() {
     if [[ -n "$release_manifest" ]]; then verify_release_asset "$relative_path" "$target"; fi
     return
   fi
+  local release_asset=''
+  release_asset="$(release_asset_name "$relative_path")"
   command -v curl >/dev/null 2>&1 || fail "curl is required to download the standard release assets"
   curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-    "$release_base_url/v$version/$relative_path" -o "$target"
+    "$release_download_base_url/v$version/$release_asset" -o "$target"
   chmod "$mode" "$target"
   verify_release_asset "$relative_path" "$target"
 }
@@ -341,6 +384,57 @@ copy_asset 'scripts/manage-internal-credential.py' 'bin/lib/manage-internal-cred
 copy_asset 'scripts/release_manifest.py' 'bin/lib/release_manifest.py' '0755'
 
 helper="$stage_dir/bin/lib/deployment_helpers.py"
+release_manifest_helper="$stage_dir/bin/lib/release_manifest.py"
+
+if [[ "$existing_install" == true && "$upgrade_existing" == true ]]; then
+  if [[ "$dry_run" == true ]]; then
+    note "DRY RUN: verify release $version and bootstrap the managed update without changing Server identity or pairing state."
+    exit 0
+  fi
+  [[ "${EUID}" -eq 0 ]] || fail "Run the installer as root, for example with sudo."
+  note "Bootstrapping the verified update command for the managed installation at $install_dir."
+  install -m 0755 "$stage_dir/bin/hermes-link" "$install_dir/bin/hermes-link"
+  install -m 0755 "$stage_dir/bin/lib/deployment_helpers.py" "$install_dir/bin/lib/deployment_helpers.py"
+  install -m 0755 "$stage_dir/bin/lib/release_manifest.py" "$install_dir/bin/lib/release_manifest.py"
+  "$install_dir/bin/hermes-link" update --version "$version"
+  exit
+fi
+
+import_release_image_archive() {
+  [[ -n "$release_manifest" ]] || fail 'OCI image archive fallback requires a verified release manifest.'
+  [[ "$(uname -m)" == 'x86_64' || "$(uname -m)" == 'amd64' ]] || \
+    fail 'OCI image archive fallback is currently available only on Linux amd64; restore GHCR pull connectivity for this host.'
+  command -v ctr >/dev/null 2>&1 || \
+    fail 'OCI image archive fallback requires the containerd ctr command used by Docker Engine.'
+  local archive_name=''
+  local archive_path=''
+  archive_name="$("$python_bin" "$release_manifest_helper" image-archive \
+    --manifest "$release_manifest" --version "$version" \
+    --image-repository "$DEFAULT_IMAGE_REPOSITORY")" || \
+    fail 'Release manifest does not provide a valid OCI image archive.'
+  archive_path="$stage_dir/$archive_name"
+  note 'GHCR image pull failed; downloading the manifest-verified OCI image archive from GitHub Release.'
+  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    "$release_download_base_url/v$version/$archive_name" -o "$archive_path" || \
+    fail 'Could not download the OCI image archive fallback.'
+  "$python_bin" "$release_manifest_helper" verify-image-archive \
+    --manifest "$release_manifest" --version "$version" \
+    --image-repository "$DEFAULT_IMAGE_REPOSITORY" --file "$archive_path" || \
+    fail 'OCI image archive integrity verification failed.'
+  ctr -n moby images import --base-name "$DEFAULT_IMAGE_REPOSITORY" --digests \
+    --index-name "$image" --platform linux/amd64 "$archive_path" || \
+    fail 'Could not import the verified OCI image archive into Docker containerd.'
+  docker image inspect "$image" >/dev/null || \
+    fail 'The imported OCI image is unavailable under the verified immutable digest.'
+  image_loaded_from_archive=true
+}
+
+pull_or_import_image() {
+  if "${compose[@]}" pull; then
+    return
+  fi
+  import_release_image_archive
+}
 
 resolve_endpoint() {
   local resolved=''
@@ -603,7 +697,6 @@ environment_tmp="$(mktemp "$install_dir/.env.XXXXXX")"
 {
   printf 'HERMES_LINK_VERSION=%s\n' "$version"
   printf 'HERMES_LINK_IMAGE=%s\n' "$image"
-  printf 'HERMES_LINK_RELEASE_BASE_URL=%s\n' "$release_base_url"
   printf 'HERMES_LINK_RELEASE_DOWNLOAD_BASE_URL=%s\n' "$release_download_base_url"
   printf 'HERMES_LINK_RELEASE_API_URL=https://api.github.com/repos/yhvspm/hermes-link-server/releases/latest\n'
   printf 'HERMES_LINK_PUBLIC_HOST=%s\n' "$domain"
@@ -624,9 +717,13 @@ if [[ "$proxy_mode" == 'caddy' ]]; then compose+=(--profile caddy); fi
 if [[ "$skip_image_pull" == true ]]; then
   docker image inspect "$image" >/dev/null || fail "Local Server image is unavailable: $image"
 else
-  "${compose[@]}" pull
+  pull_or_import_image
 fi
-"${compose[@]}" up -d --remove-orphans
+if [[ "$image_loaded_from_archive" == true ]]; then
+  "${compose[@]}" up -d --pull never --remove-orphans
+else
+  "${compose[@]}" up -d --remove-orphans
+fi
 
 wait_for_local_health() {
   local attempt

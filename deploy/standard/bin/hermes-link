@@ -10,6 +10,7 @@ release_manifest_helper="$root_dir/bin/lib/release_manifest.py"
 release_image_repository='ghcr.io/yhvspm/hermes-link-server'
 default_release_download_base_url='https://github.com/yhvspm/hermes-link-server/releases/download'
 bridge_port='18765'
+image_loaded_from_archive=false
 
 usage() {
   cat <<'EOF'
@@ -397,15 +398,62 @@ download_release_asset() {
   local relative_path="$3"
   local destination="$4"
   local base_url
-  base_url="$(env_get HERMES_LINK_RELEASE_BASE_URL)"
+  local release_asset
+  base_url="$(release_download_base_url)"
+  release_asset="$(python3 "$release_manifest_helper" release-asset-name --path "$relative_path")" || \
+    fail "Release asset path is unsupported: $relative_path"
   curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-    "$base_url/v$version/$relative_path" -o "$destination"
+    "$base_url/v$version/$release_asset" -o "$destination"
   python3 "$release_manifest_helper" verify-file \
     --manifest "$manifest" \
     --version "$version" \
     --image-repository "$release_image_repository" \
     --path "$relative_path" \
     --file "$destination"
+}
+
+import_release_image_archive() {
+  local manifest="$1"
+  local version="$2"
+  local image="$3"
+  local destination_dir="$4"
+  [[ "$(uname -m)" == 'x86_64' || "$(uname -m)" == 'amd64' ]] || \
+    fail 'OCI image archive fallback is currently available only on Linux amd64; restore GHCR pull connectivity for this host.'
+  command -v ctr >/dev/null 2>&1 || \
+    fail 'OCI image archive fallback requires the containerd ctr command used by Docker Engine.'
+  local archive_name archive_path base_url
+  archive_name="$(python3 "$release_manifest_helper" image-archive \
+    --manifest "$manifest" --version "$version" \
+    --image-repository "$release_image_repository")" || \
+    fail 'Release manifest does not provide a valid OCI image archive.'
+  archive_path="$destination_dir/$archive_name"
+  base_url="$(release_download_base_url)"
+  printf '%s\n' 'GHCR image pull failed; downloading the manifest-verified OCI image archive from GitHub Release.'
+  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    "$base_url/v$version/$archive_name" -o "$archive_path" || \
+    fail 'Could not download the OCI image archive fallback.'
+  python3 "$release_manifest_helper" verify-image-archive \
+    --manifest "$manifest" --version "$version" \
+    --image-repository "$release_image_repository" --file "$archive_path" || \
+    fail 'OCI image archive integrity verification failed.'
+  ctr -n moby images import --base-name "$release_image_repository" --digests \
+    --index-name "$image" --platform linux/amd64 "$archive_path" || \
+    fail 'Could not import the verified OCI image archive into Docker containerd.'
+  docker image inspect "$image" >/dev/null || \
+    fail 'The imported OCI image is unavailable under the verified immutable digest.'
+  image_loaded_from_archive=true
+}
+
+pull_or_import_image() {
+  local manifest="$1"
+  local version="$2"
+  local image="$3"
+  local destination_dir="$4"
+  image_loaded_from_archive=false
+  if compose pull; then
+    return
+  fi
+  import_release_image_archive "$manifest" "$version" "$image" "$destination_dir"
 }
 
 backup_current_installation() {
@@ -507,7 +555,7 @@ update_command() {
 
   old_server_id="$(identity_server_id)" || fail 'Cannot back up an invalid Server identity'
   old_profiles="$(configured_profiles)"
-  new_image="$(python3 "$release_manifest_helper" image \
+  new_image="$(python3 "$update_dir/bin/lib/release_manifest.py" image \
     --manifest "$update_dir/release-manifest.json" \
     --version "$requested_version" \
     --image-repository "$release_image_repository")" || {
@@ -528,7 +576,23 @@ update_command() {
   env_set HERMES_LINK_VERSION "$requested_version"
   env_set HERMES_LINK_IMAGE "$new_image"
 
-  if ! compose pull || ! compose up -d --remove-orphans || ! verify_updated_runtime "$old_server_id" "$old_profiles"; then
+  if ! pull_or_import_image "$update_dir/release-manifest.json" "$requested_version" "$new_image" "$update_dir"; then
+    restore_backup "$backup_dir"
+    rm -rf -- "$update_dir"
+    return 1
+  fi
+  if [[ "$image_loaded_from_archive" == true ]]; then
+    compose up -d --pull never --remove-orphans || {
+      restore_backup "$backup_dir"
+      rm -rf -- "$update_dir"
+      return 1
+    }
+  elif ! compose up -d --remove-orphans; then
+    restore_backup "$backup_dir"
+    rm -rf -- "$update_dir"
+    return 1
+  fi
+  if ! verify_updated_runtime "$old_server_id" "$old_profiles"; then
     restore_backup "$backup_dir"
     rm -rf -- "$update_dir"
     return 1

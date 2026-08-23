@@ -17,6 +17,12 @@ GATE_SPEC = importlib.util.spec_from_file_location(
 assert GATE_SPEC is not None and GATE_SPEC.loader is not None
 public_release_gate = importlib.util.module_from_spec(GATE_SPEC)
 GATE_SPEC.loader.exec_module(public_release_gate)
+MANIFEST_SPEC = importlib.util.spec_from_file_location(
+    "release_manifest", ROOT / "scripts" / "release_manifest.py"
+)
+assert MANIFEST_SPEC is not None and MANIFEST_SPEC.loader is not None
+release_manifest = importlib.util.module_from_spec(MANIFEST_SPEC)
+MANIFEST_SPEC.loader.exec_module(release_manifest)
 
 
 class StandardDeploymentAssetTests(unittest.TestCase):
@@ -61,10 +67,14 @@ class StandardDeploymentAssetTests(unittest.TestCase):
         self.assertIn("DEFAULT_RELEASE_DOWNLOAD_BASE_URL", install)
         self.assertIn("release-manifest.json", install)
         self.assertIn("verify_release_asset", install)
+        self.assertIn("release_asset_name", install)
+        self.assertIn("import_release_image_archive", install)
         self.assertIn("HERMES_LINK_RELEASE_DOWNLOAD_BASE_URL", environment)
+        self.assertNotIn("HERMES_LINK_RELEASE_BASE_URL", environment)
 
     def test_standard_release_assets_require_verified_digests(self) -> None:
         cli = (ROOT / "deploy" / "standard" / "bin" / "hermes-link").read_text(encoding="utf-8")
+        install = (ROOT / "install.sh").read_text(encoding="utf-8")
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
         self.assertIn("download_release_manifest", cli)
         self.assertIn("verify-file", cli)
@@ -73,8 +83,16 @@ class StandardDeploymentAssetTests(unittest.TestCase):
         self.assertIn("provenance: mode=max", workflow)
         self.assertIn("sbom: true", workflow)
         self.assertIn("release-manifest.json.sha256", workflow)
+        self.assertIn("skopeo copy --all", workflow)
+        self.assertIn("verify-image-archive", workflow)
+        self.assertIn("release-asset-name", workflow)
         self.assertIn(".immutable')\" = true", workflow)
         self.assertIn("docker logout ghcr.io", workflow)
+        self.assertIn("import_release_image_archive", cli)
+        self.assertIn("--pull never", cli)
+        self.assertNotIn("HERMES_LINK_RELEASE_BASE_URL", cli)
+        for asset_name in release_manifest.RELEASE_DOWNLOAD_ASSET_NAMES.values():
+            self.assertIn(asset_name, install)
 
     def test_caddy_flushes_streams_to_the_selected_loopback_bridge(self) -> None:
         caddyfile = (ROOT / "deploy" / "standard" / "Caddyfile").read_text(encoding="utf-8")
@@ -94,6 +112,7 @@ class StandardDeploymentAssetTests(unittest.TestCase):
         self.assertIn("--reuse-agent-credential", install)
         self.assertIn("--state-import-dir", install)
         self.assertIn("--skip-image-pull", install)
+        self.assertIn("--upgrade-existing", install)
         self.assertIn("server-identity.json hermes_link_server_identity.json", install)
         self.assertIn("cloud-config.json hermes_link_cloud_config.json", install)
         self.assertIn('"$state_identity_source" "$install_dir/data/server/server-identity.json"', install)

@@ -11,7 +11,8 @@ state locally, and treats Cloud notifications as optional.
 On a supported Ubuntu host that already runs Hermes Agent and Docker Compose:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yhvspm/hermes-link-server/v1.0.0/install.sh | sudo bash
+curl -fL https://github.com/yhvspm/hermes-link-server/releases/download/v1.0.1/hermes-link-server-install.sh -o hermes-link-server-install.sh
+sudo bash hermes-link-server-install.sh
 ```
 
 The installer asks for:
@@ -19,6 +20,11 @@ The installer asks for:
 - A public DNS name
 - A public HTTPS port (default: `443`)
 - Automatic Caddy HTTPS, or an existing reverse proxy
+
+To migrate an existing managed `v1.0.0` installation without changing its
+identity or pairing state, run the same downloaded installer with
+`--upgrade-existing`. It first stages the verified `v1.0.1` update command,
+then uses the normal backup-and-rollback update flow.
 
 When the selected port is `443`, the App URL is `https://hermes.example.com`.
 For another port it is `https://hermes.example.com:18443`. The private internal
@@ -45,11 +51,17 @@ previous image, configuration, and state automatically.
 
 ## Release integrity
 
-Published installs download `release-manifest.json` from the GitHub Release
-and verify every standard deployment asset against its SHA-256 digest. The
-generated runtime `.env` uses the manifest's immutable GHCR
-`@sha256` image reference, not a mutable image tag. `sudo hermes-link doctor`
-checks that the installed manifest still matches the configured image.
+Published installs download `release-manifest.json` and every standard
+deployment asset from the GitHub Release, verifying each SHA-256 digest. The
+generated runtime `.env` uses the manifest's immutable GHCR `@sha256` image
+reference, not a mutable image tag. `sudo hermes-link doctor` checks that the
+installed manifest still matches the configured image.
+
+The installer and `update` command pull that digest normally. If the GHCR data
+path fails on a Linux amd64 Docker host, they download the release's
+manifest-bound OCI archive, verify its file hash and embedded image digest, and
+import it into Docker's containerd store before starting the runtime. The
+archive is a fallback only; it never replaces a successful registry pull.
 
 Every release workflow also publishes a BuildKit provenance record and SBOM,
 then verifies the downloaded manifest and image digest after publication.

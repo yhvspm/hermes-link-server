@@ -29,13 +29,15 @@ The review still requires a human check for:
   release immutability**. The release workflow publishes assets through a
   draft and then asserts the GitHub release API reports `immutable: true`; do
   not announce a release whose workflow did not pass that check.
-- Confirm that `release-manifest.json` and
-  `release-manifest.json.sha256` are attached to the release. The manifest
-  must bind the exact Git commit, all standard deployment assets, and a
+- Confirm that `release-manifest.json`, `release-manifest.json.sha256`, all
+  named standard deployment assets, and the Linux amd64 OCI image archive are
+  attached to the release. The manifest must bind the exact Git commit, all
+  standard deployment assets, the archive SHA-256, and a
   `ghcr.io/yhvspm/hermes-link-server@sha256:...` image. Runtime installation
-  and updates reject a mismatched asset or a mutable image reference.
-- Docker image contents, the generated SBOM/provenance records, and the
-  exact image digest rather than a mutable package tag. The release workflow
+  and updates reject a mismatched asset, archive, or mutable image reference.
+- Docker image contents, the generated SBOM/provenance records, the exact
+  image digest rather than a mutable package tag, and an OCI archive whose
+  embedded root descriptor retains that exact digest. The release workflow
   logs out of GHCR and verifies anonymous digest access before creating the
   GitHub Release; do not bypass a failure here by relying on authenticated
   access.

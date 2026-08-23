@@ -1,6 +1,12 @@
 # Changelog
 
-## 1.0.0 - Unreleased split
+## 1.0.1 - Immutable archive fallback
+
+- Publish verified standard deployment assets directly on each immutable GitHub Release.
+- Bind a Linux amd64 OCI image archive and its SHA-256 to the release manifest.
+- Fall back to the verified archive only when normal immutable GHCR pulls fail.
+
+## 1.0.0 - Initial public release
 
 - Established Hermes Link Protocol v1 and feature capability discovery.
 - Migrated Pairing, Server Identity, DIRECT notification storage and Cloud Protocol v2 sender.

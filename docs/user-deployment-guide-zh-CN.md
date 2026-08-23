@@ -1,6 +1,6 @@
 # Hermes Link Server 用户部署手册
 
-> 适用版本：Hermes Link Server 1.0.0、Hermes Link Protocol v1。  
+> 适用版本：Hermes Link Server 1.0.1、Hermes Link Protocol v1。
 > 原则：**自托管是基础模式；Cloud 可选；Hermes Link Server 是 App 与 Hermes Agent 的兼容边界。**
 
 本手册部署的是 `hermes-link-server`，不是 Hermes Agent、不是 Cloud

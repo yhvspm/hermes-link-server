@@ -2,7 +2,7 @@
 
 > Self-hosted is the baseline. Cloud is optional. Hermes Link Server is the compatibility boundary between clients and Hermes Agent.
 
-Repository visibility: **Public**. Server version: **1.0.0**.
+Repository visibility: **Public**. Server version: **1.0.1**.
 
 ```text
 Hermes Link App
@@ -54,4 +54,3 @@ APP
 - `integrations/hermes_agent/`: the only package allowed to know Hermes Agent internal endpoints or versions.
 - `notifications/cloud_sender.py`: HTTPS protocol client only; it cannot import Cloud code or access Cloud storage.
 - `compat/`: temporary version patches retained for compatibility migration, not a permanent application dependency.
-

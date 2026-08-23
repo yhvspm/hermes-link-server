@@ -15,7 +15,7 @@ cross-repository design.
 
 ## Repository role
 
-Public, self-hostable compatibility server between clients and Hermes Agent. Versioned independently as `1.0.0`.
+Public, self-hostable compatibility server between clients and Hermes Agent. Versioned independently from App and Cloud.
 
 ## Allowed responsibilities
 
@@ -52,4 +52,3 @@ Public, self-hostable compatibility server between clients and Hermes Agent. Ver
 
 - Inspect status, branch, HEAD, diff and untracked paths first.
 - No reset, overwrite checkout, clean, deletion of user changes, commit, push, publish, deploy or credential action without explicit approval.
-

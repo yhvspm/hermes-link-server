@@ -60,11 +60,28 @@ jobs:
           labels: ${{ steps.metadata.outputs.labels }}
           provenance: mode=max
           sbom: true
+      - name: Create and verify the Linux amd64 OCI image archive
+        id: archive
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes skopeo
+          image="ghcr.io/${GITHUB_REPOSITORY}@${IMAGE_DIGEST}"
+          archive="hermes-link-server-${RELEASE_VERSION}-linux-amd64.oci.tar"
+          skopeo copy --all "docker://${image}" "oci-archive:${archive}:hermes-link-server"
+          python scripts/release_manifest.py verify-oci-archive \
+            --archive "$archive" \
+            --image "$image" \
+            --platform linux/amd64
+          printf 'file=%s\n' "$archive" >> "$GITHUB_OUTPUT"
       - name: Create and verify the release manifest
         env:
           RELEASE_VERSION: ${{ steps.release.outputs.version }}
           SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_ARCHIVE: ${{ steps.archive.outputs.file }}
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY}@${IMAGE_DIGEST}"
           python scripts/release_manifest.py create \
@@ -72,6 +89,7 @@ jobs:
             --version "$RELEASE_VERSION" \
             --source-commit "$SOURCE_COMMIT" \
             --image "$image" \
+            --image-archive "$IMAGE_ARCHIVE" \
             --output release-manifest.json
           python scripts/release_manifest.py verify \
             --manifest release-manifest.json \
@@ -94,6 +112,10 @@ jobs:
           done
           sha256sum release-manifest.json > release-manifest.json.sha256
           sha256sum --check release-manifest.json.sha256
+          python scripts/release_manifest.py verify-image-archive \
+            --manifest release-manifest.json \
+            --version "$RELEASE_VERSION" \
+            --file "$IMAGE_ARCHIVE"
           docker buildx imagetools inspect "$image"
       - name: Verify the digest image is publicly pullable
         env:
@@ -102,25 +124,43 @@ jobs:
           image="ghcr.io/${GITHUB_REPOSITORY}@${IMAGE_DIGEST}"
           docker logout ghcr.io || true
           docker buildx imagetools inspect "$image"
+      - name: Prepare verified deployment assets
+        run: |
+          mkdir release-assets
+          for asset in \
+            install.sh \
+            deploy/standard/compose.yaml \
+            deploy/standard/Caddyfile \
+            deploy/standard/.env.example \
+            deploy/standard/bin/hermes-link \
+            scripts/deployment_helpers.py \
+            scripts/bootstrap-hermes-agent-access.sh \
+            scripts/manage-internal-credential.py \
+            scripts/release_manifest.py; do
+            name="$(python scripts/release_manifest.py release-asset-name --path "$asset")"
+            install -m 0644 "$asset" "release-assets/$name"
+          done
       - name: Publish the release assets from a draft
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" --draft --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
-          gh release upload "$GITHUB_REF_NAME" release-manifest.json release-manifest.json.sha256
+          gh release upload "$GITHUB_REF_NAME" release-manifest.json release-manifest.json.sha256 "${{ steps.archive.outputs.file }}" release-assets/*
           gh release edit "$GITHUB_REF_NAME" --draft=false
       - name: Verify the published release and immutable image reference
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ steps.release.outputs.version }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_ARCHIVE: ${{ steps.archive.outputs.file }}
         run: |
           test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft')" = false
           test "$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq '.immutable')" = true
           mkdir published-release
           gh release download "$GITHUB_REF_NAME" --dir published-release \
             --pattern release-manifest.json \
-            --pattern release-manifest.json.sha256
+            --pattern release-manifest.json.sha256 \
+            --pattern "$IMAGE_ARCHIVE"
           (
             cd published-release
             sha256sum --check release-manifest.json.sha256
@@ -129,3 +169,25 @@ jobs:
             --manifest published-release/release-manifest.json \
             --version "$RELEASE_VERSION"
           test "$(python scripts/release_manifest.py image --manifest published-release/release-manifest.json --version "$RELEASE_VERSION")" = "ghcr.io/${GITHUB_REPOSITORY}@${IMAGE_DIGEST}"
+          python scripts/release_manifest.py verify-image-archive \
+            --manifest published-release/release-manifest.json \
+            --version "$RELEASE_VERSION" \
+            --file "published-release/$IMAGE_ARCHIVE"
+          for asset in \
+            install.sh \
+            deploy/standard/compose.yaml \
+            deploy/standard/Caddyfile \
+            deploy/standard/.env.example \
+            deploy/standard/bin/hermes-link \
+            scripts/deployment_helpers.py \
+            scripts/bootstrap-hermes-agent-access.sh \
+            scripts/manage-internal-credential.py \
+            scripts/release_manifest.py; do
+            name="$(python scripts/release_manifest.py release-asset-name --path "$asset")"
+            gh release download "$GITHUB_REF_NAME" --dir published-release --pattern "$name"
+            python scripts/release_manifest.py verify-file \
+              --manifest published-release/release-manifest.json \
+              --version "$RELEASE_VERSION" \
+              --path "$asset" \
+              --file "published-release/$name"
+          done
