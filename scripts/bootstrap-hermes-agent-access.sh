@@ -6,9 +6,10 @@ usage() {
   cat <<'EOF'
 Usage: sudo ./scripts/bootstrap-hermes-agent-access.sh [options]
 
-Creates or rotates the dedicated Hermes Link-to-Agent credential, injects it
-into the Hermes Agent systemd service, and starts that service. No Agent API
-token is requested, printed, or taken from the command line.
+Creates or rotates the dedicated private Hermes Link-to-Agent credential,
+enables Hermes Gateway's loopback-only compatible HTTP API, injects it into
+the Hermes Agent systemd service, and starts that service. No Agent API token
+is requested, printed, or taken from the command line.
 
 Options:
   --agent-service NAME     Hermes Agent systemd unit (default: hermes-gateway.service)
@@ -18,7 +19,8 @@ Options:
   --agent-command PATH     Hermes CLI command used only when the service is absent (default: hermes)
   --agent-run-as-user USER Agent owner for first-time service installation
   --hermes-home PATH       Agent metadata directory (default: <agent home>/.hermes)
-  --credential-file PATH   Dedicated root-only credential file
+  --credential-file PATH   Dedicated private credential file
+  --agent-base-url URL     Agent loopback origin (default: detect 8642 or 8080)
   --parallel-agent-credential
                             Keep an existing mobile credential while adding this Server credential
   --rotate                 Replace the existing dedicated credential
@@ -33,6 +35,7 @@ agent_command="${HERMES_AGENT_COMMAND:-hermes}"
 agent_user=''
 hermes_home=''
 credential_file='/etc/hermes-link-server/internal-agent.env'
+agent_base_url="${HERMES_AGENT_BASE_URL:-}"
 rotate=false
 parallel_agent_credential=false
 dry_run=false
@@ -47,6 +50,7 @@ while [[ $# -gt 0 ]]; do
     --agent-run-as-user) agent_user="${2:-}"; shift 2 ;;
     --hermes-home) hermes_home="${2:-}"; shift 2 ;;
     --credential-file) credential_file="${2:-}"; shift 2 ;;
+    --agent-base-url) agent_base_url="${2:-}"; shift 2 ;;
     --parallel-agent-credential) parallel_agent_credential=true; shift ;;
     --rotate) rotate=true; shift ;;
     --dry-run) dry_run=true; shift ;;
@@ -101,18 +105,37 @@ fi
 drop_in_dir="/etc/systemd/system/$agent_service.d"
 drop_in_file="$drop_in_dir/hermes-link.conf"
 agent_uid=''
-if [[ "$agent_service_scope" == 'user' && "$dry_run" == false ]]; then
-  agent_uid="$(id -u "$agent_user")"
-  agent_home="$(getent passwd "$agent_user" | cut -d: -f6)"
-  drop_in_dir="$agent_home/.config/systemd/user/$agent_service.d"
-  drop_in_file="$drop_in_dir/hermes-link.conf"
-elif [[ "$agent_service_scope" == 'user' ]]; then
-  agent_home="/home/$agent_user"
-  if [[ "$agent_user" == 'root' ]]; then agent_home='/root'; fi
+agent_home=''
+if [[ "$agent_service_scope" == 'user' ]]; then
+  if [[ "$dry_run" == false ]]; then
+    agent_uid="$(id -u "$agent_user")"
+    agent_home="$(getent passwd "$agent_user" | cut -d: -f6)"
+  else
+    agent_home="/home/$agent_user"
+    if [[ "$agent_user" == 'root' ]]; then agent_home='/root'; fi
+  fi
+  [[ -n "$agent_home" ]] || { echo "Cannot determine home directory for $agent_user" >&2; exit 1; }
+  if [[ "$credential_file" == '/etc/hermes-link-server/internal-agent.env' ]]; then
+    credential_file="$agent_home/.config/hermes-link-server/internal-agent.env"
+  fi
   drop_in_dir="$agent_home/.config/systemd/user/$agent_service.d"
   drop_in_file="$drop_in_dir/hermes-link.conf"
 fi
-credential_args=(--credential-file "$credential_file" --hermes-home "$hermes_home")
+if [[ -z "$agent_base_url" ]] && command -v ss >/dev/null 2>&1; then
+  for candidate in 'http://127.0.0.1:8642' 'http://127.0.0.1:8080'; do
+    candidate_port="${candidate##*:}"
+    if ss -ltnH "( sport = :$candidate_port )" 2>/dev/null | grep -q .; then
+      agent_base_url="$candidate"
+      break
+    fi
+  done
+fi
+if [[ -z "$agent_base_url" ]]; then agent_base_url='http://127.0.0.1:8642'; fi
+credential_args=(
+  --credential-file "$credential_file"
+  --hermes-home "$hermes_home"
+  --agent-base-url "$agent_base_url"
+)
 if [[ "$rotate" == true ]]; then
   credential_args+=(--rotate)
 fi
@@ -123,7 +146,8 @@ fi
 if [[ "$dry_run" == true ]]; then
   printf '%s\n' \
     "DRY RUN: ensure $agent_service ($agent_service_scope scope) exists; if absent install it through the Hermes CLI for user $agent_user." \
-    "DRY RUN: create or rotate a root-only dedicated Hermes Link credential at $credential_file without printing its value." \
+    "DRY RUN: create or rotate a private dedicated Hermes Link credential at $credential_file without printing its value." \
+    "DRY RUN: use Hermes Agent loopback origin $agent_base_url." \
     "DRY RUN: write $drop_in_file with EnvironmentFile=$credential_file." \
     "DRY RUN: reload systemd and restart $agent_service."
   if [[ "$parallel_agent_credential" == true ]]; then
@@ -150,7 +174,15 @@ if ! run_agent_systemctl cat "$agent_service" >/dev/null 2>&1; then
   fi
 fi
 
-"$python_bin" "$script_dir/manage-internal-credential.py" "${credential_args[@]}"
+if [[ "$agent_service_scope" == 'user' ]]; then
+  runuser -u "$agent_user" -- "$python_bin" "$script_dir/manage-internal-credential.py" "${credential_args[@]}"
+  runuser -u "$agent_user" -- test -r "$credential_file" || {
+    echo "User-scoped Agent service cannot read its dedicated credential file." >&2
+    exit 1
+  }
+else
+  "$python_bin" "$script_dir/manage-internal-credential.py" "${credential_args[@]}"
+fi
 install -d -m 0755 "$drop_in_dir"
 temporary_drop_in="$(mktemp "$drop_in_dir/.hermes-link.XXXXXX")"
 trap 'rm -f "$temporary_drop_in"' EXIT
@@ -162,7 +194,12 @@ install -m 0644 "$temporary_drop_in" "$drop_in_file"
 rm -f "$temporary_drop_in"
 trap - EXIT
 run_agent_systemctl daemon-reload
-run_agent_systemctl enable --now "$agent_service"
+run_agent_systemctl enable "$agent_service"
+if run_agent_systemctl is-active --quiet "$agent_service"; then
+  run_agent_systemctl restart "$agent_service"
+else
+  run_agent_systemctl start "$agent_service"
+fi
 run_agent_systemctl is-active --quiet "$agent_service"
 
 if systemctl cat hermes-link-server.service >/dev/null 2>&1; then

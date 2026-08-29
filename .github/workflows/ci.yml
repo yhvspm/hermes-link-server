@@ -40,7 +40,22 @@ jobs:
           docker run --rm \
             -e HERMES_LINK_PUBLIC_HOST=hermes.example.com \
             -e HERMES_LINK_PUBLIC_PORT=18443 \
+            -e HERMES_LINK_LISTEN_PORT=18443 \
+            -e HERMES_LINK_TLS_DIRECTIVE= \
             -v "$PWD/deploy/standard/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2.8-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          mkdir -p .ci-caddy-data/manual-tls
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout .ci-caddy-data/manual-tls/privkey.pem \
+            -out .ci-caddy-data/manual-tls/fullchain.pem \
+            -days 1 -subj '/CN=hermes.example.com' >/dev/null 2>&1
+          docker run --rm \
+            -e HERMES_LINK_PUBLIC_HOST=hermes.example.com \
+            -e HERMES_LINK_PUBLIC_PORT=34443 \
+            -e HERMES_LINK_LISTEN_PORT=443 \
+            -e 'HERMES_LINK_TLS_DIRECTIVE=tls /data/manual-tls/fullchain.pem /data/manual-tls/privkey.pem' \
+            -v "$PWD/deploy/standard/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            -v "$PWD/.ci-caddy-data:/data:ro" \
             caddy:2.8-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
       - name: Docker image smoke test
         run: |

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.2 - Direct HTTP/IP deployment
+
+- Create the dedicated credential as the Agent user for user-scoped systemd
+  services, while preserving root-owned credentials for system-scoped Agents.
+- Bind Hermes Link Server directly to the selected unprivileged HTTP port;
+  remove managed Caddy, certificate, and TCP `80` dependencies.
+- Accept App-facing IP addresses as well as DNS names, and allow HTTP pairing
+  QR payloads for trusted-network deployments.
+- Keep HTTPS available only as a user-managed external proxy concern.
+
 ## 1.0.1 - Immutable archive fallback
 
 - Publish verified standard deployment assets directly on each immutable GitHub Release.

@@ -5,31 +5,33 @@ umask 077
 # This is the supported entry point for the standard Docker runtime. It is
 # intentionally independent from the older development/validation Compose
 # assets under deploy/docker.
-DEFAULT_VERSION='1.0.1'
+DEFAULT_VERSION='1.0.2'
 DEFAULT_IMAGE_REPOSITORY='ghcr.io/yhvspm/hermes-link-server'
 DEFAULT_RELEASE_DOWNLOAD_BASE_URL='https://github.com/yhvspm/hermes-link-server/releases/download'
 INSTALL_DIR='/opt/hermes-link'
 INTERNAL_CREDENTIAL_FILE='/etc/hermes-link-server/internal-agent.env'
-INTERNAL_BRIDGE_PORT='18765'
+MOBILE_CREDENTIAL_FILE='/etc/hermes-link-server/mobile-api.env'
 
 usage() {
   cat <<'EOF'
-Usage: curl -fL https://github.com/yhvspm/hermes-link-server/releases/download/v1.0.1/hermes-link-server-install.sh -o hermes-link-server-install.sh
+Usage: curl -fL https://github.com/yhvspm/hermes-link-server/releases/download/v1.0.2/hermes-link-server-install.sh -o hermes-link-server-install.sh
        sudo bash hermes-link-server-install.sh
 
 Or from a reviewed release tree:
   sudo bash ./install.sh [options]
 
 Options:
-  --domain DOMAIN              Public DNS name for Hermes Link
-  --public-port PORT           Public HTTPS port (default: 443)
-  --proxy-mode MODE            caddy (default) or external
+  --host HOST                  App-facing IP address or DNS name for direct HTTP
+  --public-port PORT           App-facing HTTP port (default: 18766)
+  --public-url URL             Advanced App URL for direct HTTP or an external HTTPS proxy
+  --listen-host HOST           0.0.0.0 (default for HTTP) or 127.0.0.1 (external proxy)
+  --listen-port PORT           Server HTTP listener (default: public port for HTTP)
   --agent-service NAME         Hermes Agent systemd service (default: hermes-gateway.service)
   --agent-service-scope SCOPE  system (default) or user
   --agent-user USER            Hermes Agent operating-system user
   --hermes-home PATH           Hermes metadata directory
   --image IMAGE                Advanced local-source image override
-  --version VERSION            Pinned release version (default: 1.0.1)
+  --version VERSION            Pinned release version (default: 1.0.2)
   --source-dir PATH            Use local release assets instead of downloading them
   --install-dir PATH           Installation directory (default: /opt/hermes-link)
   --upgrade-existing           Bootstrap a managed installation into this pinned release
@@ -41,7 +43,7 @@ Options:
   --dry-run                    Validate choices and print the planned operations only
   -h, --help                   Show this help
 
-The normal flow asks only for a DNS name, a public HTTPS port, and HTTPS mode.
+The normal flow asks only for an App-facing IP/DNS address and a public HTTP port.
 It never asks for, prints, or copies an upstream Hermes Agent token.
 EOF
 }
@@ -57,12 +59,15 @@ note() {
 
 version="$DEFAULT_VERSION"
 image=''
-domain=''
+public_host=''
+public_url_input=''
 public_port=''
-proxy_mode=''
+listen_port=''
+listen_host=''
 agent_service='hermes-gateway.service'
 agent_service_scope='system'
 agent_user=''
+agent_home=''
 hermes_home=''
 source_dir=''
 install_dir="$INSTALL_DIR"
@@ -73,7 +78,6 @@ state_cloud_source=''
 skip_image_pull=false
 image_loaded_from_archive=false
 upgrade_existing=false
-internal_bridge_port="$INTERNAL_BRIDGE_PORT"
 dry_run=false
 non_interactive=false
 release_download_base_url="${HERMES_LINK_RELEASE_DOWNLOAD_BASE_URL:-$DEFAULT_RELEASE_DOWNLOAD_BASE_URL}"
@@ -81,9 +85,11 @@ python_bin="${HERMES_LINK_PYTHON:-python3}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --domain) domain="${2:-}"; shift 2 ;;
+    --host) public_host="${2:-}"; shift 2 ;;
     --public-port) public_port="${2:-}"; shift 2 ;;
-    --proxy-mode) proxy_mode="${2:-}"; shift 2 ;;
+    --public-url) public_url_input="${2:-}"; shift 2 ;;
+    --listen-host) listen_host="${2:-}"; shift 2 ;;
+    --listen-port) listen_port="${2:-}"; shift 2 ;;
     --agent-service) agent_service="${2:-}"; shift 2 ;;
     --agent-service-scope) agent_service_scope="${2:-}"; shift 2 ;;
     --agent-user) agent_user="${2:-}"; shift 2 ;;
@@ -125,6 +131,9 @@ if [[ ! "$agent_service" =~ ^[A-Za-z0-9_.@-]+\.service$ ]]; then
 fi
 if [[ "$agent_service_scope" != 'system' && "$agent_service_scope" != 'user' ]]; then
   fail "--agent-service-scope must be system or user"
+fi
+if [[ "$agent_service_scope" == 'user' && -n "$reuse_agent_credential" ]]; then
+  fail "--reuse-agent-credential is not supported with a user-scoped Agent service"
 fi
 if [[ "$release_download_base_url" != https://* ]]; then
   fail "HERMES_LINK_RELEASE_DOWNLOAD_BASE_URL must use HTTPS"
@@ -171,13 +180,13 @@ ensure_ubuntu_prerequisites() {
   [[ "${EUID}" -eq 0 ]] || fail "Run the installer as root, for example with sudo."
   local missing=()
   local command_name
-  for command_name in "$python_bin" curl openssl; do
+  for command_name in "$python_bin" curl; do
     command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
   done
   if (( ${#missing[@]} > 0 )); then
     note "Installing required host tools: ${missing[*]}"
     apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y python3 curl openssl ca-certificates
+    DEBIAN_FRONTEND=noninteractive apt-get install -y python3 curl ca-certificates
   fi
   if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
     fail "Docker Engine and the Docker Compose v2 plugin are required. Install Docker first, then rerun this command."
@@ -234,7 +243,6 @@ manifest_path, expected_version, image_repository, requested_path, requested_val
 release_paths = {
     "install.sh",
     "deploy/standard/compose.yaml",
-    "deploy/standard/Caddyfile",
     "deploy/standard/.env.example",
     "deploy/standard/bin/hermes-link",
     "scripts/deployment_helpers.py",
@@ -307,7 +315,6 @@ release_asset_name() {
   case "$1" in
     install.sh) printf '%s' 'hermes-link-server-install.sh' ;;
     deploy/standard/compose.yaml) printf '%s' 'hermes-link-server-compose.yaml' ;;
-    deploy/standard/Caddyfile) printf '%s' 'hermes-link-server-Caddyfile' ;;
     deploy/standard/.env.example) printf '%s' 'hermes-link-server-env.example' ;;
     deploy/standard/bin/hermes-link) printf '%s' 'hermes-link-server-cli' ;;
     scripts/deployment_helpers.py) printf '%s' 'hermes-link-server-deployment-helpers.py' ;;
@@ -375,7 +382,6 @@ copy_asset() {
 }
 
 copy_asset 'deploy/standard/compose.yaml' 'compose.yaml' '0644'
-copy_asset 'deploy/standard/Caddyfile' 'Caddyfile' '0644'
 copy_asset 'deploy/standard/.env.example' '.env.example' '0644'
 copy_asset 'deploy/standard/bin/hermes-link' 'bin/hermes-link' '0755'
 copy_asset 'scripts/deployment_helpers.py' 'bin/lib/deployment_helpers.py' '0755'
@@ -386,19 +392,125 @@ copy_asset 'scripts/release_manifest.py' 'bin/lib/release_manifest.py' '0755'
 helper="$stage_dir/bin/lib/deployment_helpers.py"
 release_manifest_helper="$stage_dir/bin/lib/release_manifest.py"
 
-if [[ "$existing_install" == true && "$upgrade_existing" == true ]]; then
-  if [[ "$dry_run" == true ]]; then
-    note "DRY RUN: verify release $version and bootstrap the managed update without changing Server identity or pairing state."
-    exit 0
+set_existing_environment_value() {
+  local key="$1"
+  local value="$2"
+  python3 - "$install_dir/.env" "$key" "$value" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+key = sys.argv[2]
+value = sys.argv[3]
+prefix = f"{key}="
+lines = path.read_text(encoding="utf-8").splitlines()
+updated = False
+result = []
+for line in lines:
+    if line.startswith(prefix):
+        result.append(prefix + value)
+        updated = True
+    else:
+        result.append(line)
+if not updated:
+    result.append(prefix + value)
+path.write_text("\n".join(result) + "\n", encoding="utf-8")
+path.chmod(0o600)
+PY
+}
+
+remove_existing_environment_value() {
+  local key="$1"
+  python3 - "$install_dir/.env" "$key" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+prefix = f"{sys.argv[2]}="
+lines = [line for line in path.read_text(encoding="utf-8").splitlines() if not line.startswith(prefix)]
+path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+path.chmod(0o600)
+PY
+}
+
+migrate_local_existing_installation() {
+  [[ "$skip_image_pull" == true ]] || \
+    fail 'A local-source upgrade requires --skip-image-pull with an already-built local image.'
+  [[ -n "$reuse_agent_credential" ]] || \
+    fail 'A local-source upgrade requires --reuse-agent-credential to leave the Hermes Agent unchanged.'
+  docker image inspect "$image" >/dev/null || fail "Local Server image is unavailable: $image"
+
+  local backup_dir old_server_id old_profiles legacy_proxy_file
+  local old_compose=(docker compose --env-file "$install_dir/.env" --project-directory "$install_dir" -f "$install_dir/compose.yaml")
+  backup_dir="$install_dir/backups/$(date -u +%Y%m%dT%H%M%SZ)-pre-direct-http"
+  old_server_id="$(python3 "$helper" server-id --identity-file "$install_dir/data/server/server-identity.json")" || \
+    fail 'Cannot read the existing Server identity before upgrade.'
+  old_profiles="$(awk -F= '$1 == "HERMES_LINK_PROFILE_IDS" {print $2; exit}' "$install_dir/.env")"
+
+  "${old_compose[@]}" stop || fail 'Could not stop the managed runtime for a consistent upgrade backup.'
+  if ! {
+    install -d -m 0700 "$backup_dir/config"
+    cp -a "$install_dir/.env" "$install_dir/compose.yaml" "$install_dir/.env.example" "$backup_dir/config/"
+    cp -a "$install_dir/bin" "$backup_dir/config/bin"
+    legacy_proxy_file="$(find "$install_dir" -maxdepth 1 -type f -iname 'caddyfile' -print -quit)"
+    if [[ -n "$legacy_proxy_file" ]]; then cp -a "$legacy_proxy_file" "$backup_dir/config/legacy-proxy.conf"; fi
+    if [[ -f "$install_dir/release-manifest.json" ]]; then cp -a "$install_dir/release-manifest.json" "$backup_dir/config/release-manifest.json"; fi
+    tar -czf "$backup_dir/server-state.tar.gz" -C "$install_dir/data" server
+  }; then
+    "${old_compose[@]}" start >/dev/null 2>&1 || true
+    fail 'Could not create a consistent upgrade backup.'
   fi
-  [[ "${EUID}" -eq 0 ]] || fail "Run the installer as root, for example with sudo."
-  note "Bootstrapping the verified update command for the managed installation at $install_dir."
-  install -m 0755 "$stage_dir/bin/hermes-link" "$install_dir/bin/hermes-link"
-  install -m 0755 "$stage_dir/bin/lib/deployment_helpers.py" "$install_dir/bin/lib/deployment_helpers.py"
-  install -m 0755 "$stage_dir/bin/lib/release_manifest.py" "$install_dir/bin/lib/release_manifest.py"
-  "$install_dir/bin/hermes-link" update --version "$version"
-  exit
-fi
+
+  local restore_needed=true
+  restore_existing_installation() {
+    [[ "$restore_needed" == true ]] || return 0
+    docker compose --env-file "$install_dir/.env" --project-directory "$install_dir" -f "$install_dir/compose.yaml" down --remove-orphans >/dev/null 2>&1 || true
+    cp -a "$backup_dir/config/." "$install_dir/"
+    if [[ -d "$install_dir/data/server" ]]; then mv "$install_dir/data/server" "$backup_dir/failed-server-state"; fi
+    tar -xzf "$backup_dir/server-state.tar.gz" -C "$install_dir/data"
+    "${old_compose[@]}" up -d --remove-orphans >/dev/null
+    restore_needed=false
+  }
+
+  if ! {
+    cp -a "$stage_dir/compose.yaml" "$stage_dir/.env.example" "$install_dir/"
+    cp -a "$stage_dir/bin/." "$install_dir/bin/"
+    find "$install_dir" -maxdepth 1 -type f -iname 'caddyfile' -delete
+    rm -f -- "$install_dir/release-manifest.json"
+    set_existing_environment_value HERMES_LINK_VERSION "$version"
+    set_existing_environment_value HERMES_LINK_IMAGE "$image"
+    set_existing_environment_value HERMES_LINK_RELEASE_DOWNLOAD_BASE_URL "$release_download_base_url"
+    set_existing_environment_value HERMES_LINK_RELEASE_API_URL 'https://api.github.com/repos/yhvspm/hermes-link-server/releases/latest'
+    set_existing_environment_value HERMES_LINK_PUBLIC_HOST "$public_host"
+    set_existing_environment_value HERMES_LINK_PUBLIC_PORT "$public_port"
+    set_existing_environment_value HERMES_LINK_PUBLIC_URL "$public_url"
+    set_existing_environment_value HERMES_LINK_LISTEN_HOST "$listen_host"
+    set_existing_environment_value HERMES_LINK_LISTEN_PORT "$listen_port"
+    set_existing_environment_value HERMES_LINK_AGENT_HOME_HOST "$hermes_home"
+    set_existing_environment_value HERMES_LINK_INTERNAL_ENV_FILE "$agent_credential_file"
+    set_existing_environment_value HERMES_LINK_MOBILE_ENV_FILE "$mobile_credential_file"
+    set_existing_environment_value HERMES_LINK_FIREWALL_MANAGED '0'
+    remove_existing_environment_value HERMES_LINK_PROXY_MODE
+    remove_existing_environment_value HERMES_LINK_BRIDGE_PORT
+    install -d -m 0700 "$install_dir/data/server"
+    chown 10001:10001 "$install_dir/data/server"
+    install -d -m 0750 "$install_dir/data/server/model-config"
+    chown 0:10001 "$install_dir/data/server/model-config"
+    docker compose --env-file "$install_dir/.env" --project-directory "$install_dir" -f "$install_dir/compose.yaml" up -d --pull never --remove-orphans
+    for _ in {1..30}; do
+      curl --fail --silent --max-time 3 "http://127.0.0.1:$listen_port/health" >/dev/null && break
+      sleep 2
+    done
+    curl --fail --silent --max-time 3 "http://127.0.0.1:$listen_port/health" >/dev/null
+    [[ "$(python3 "$helper" server-id --identity-file "$install_dir/data/server/server-identity.json")" == "$old_server_id" ]]
+    [[ "$(awk -F= '$1 == "HERMES_LINK_PROFILE_IDS" {print $2; exit}' "$install_dir/.env")" == "$old_profiles" ]]
+  }; then
+    restore_existing_installation
+    fail 'Local-source upgrade failed and the previous installation was restored.'
+  fi
+  restore_needed=false
+  note "Local-source upgrade completed. Server identity and Profiles were retained; App URL is $public_url."
+}
 
 import_release_image_archive() {
   [[ -n "$release_manifest" ]] || fail 'OCI image archive fallback requires a verified release manifest.'
@@ -429,8 +541,8 @@ import_release_image_archive() {
   image_loaded_from_archive=true
 }
 
-pull_or_import_image() {
-  if "${compose[@]}" pull; then
+pull_or_import_server_image() {
+  if docker pull "$image"; then
     return
   fi
   import_release_image_archive
@@ -439,40 +551,32 @@ pull_or_import_image() {
 resolve_endpoint() {
   local resolved=''
   while true; do
-    if [[ -z "$domain" ]]; then
-      domain="$(prompt_value '请输入 Hermes Link 域名' '')" || fail "Pass --domain when no terminal is available"
+    if [[ -n "$public_url_input" ]]; then
+      resolved="$("$python_bin" "$helper" endpoint --url "$public_url_input" --port "$public_port" 2>&1)" || true
+    else
+      if [[ -z "$public_host" ]]; then
+        local detected_host=''
+        if command -v ip >/dev/null 2>&1; then
+          detected_host="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (index = 1; index <= NF; index++) if ($index == "src") { print $(index + 1); exit }}')"
+        fi
+        public_host="$(prompt_value '请输入 App 可访问的 IP 或域名' "$detected_host")" || \
+          fail "Pass --host or --public-url when no terminal is available"
+      fi
+      if [[ -z "$public_port" ]]; then
+        public_port="$(prompt_value '请输入公网 HTTP 端口' '18766')" || \
+          fail "Pass --public-port when no terminal is available"
+      fi
+      resolved="$("$python_bin" "$helper" endpoint --host "$public_host" --port "$public_port" --scheme http 2>&1)" || true
     fi
-    if [[ -z "$public_port" ]]; then
-      public_port="$(prompt_value '请输入公网 HTTPS 端口' '443')" || fail "Pass --public-port when no terminal is available"
-    fi
-    if resolved="$("$python_bin" "$helper" endpoint --host "$domain" --port "$public_port" 2>&1)"; then
-      IFS=$'\t' read -r domain public_port public_url <<< "$resolved"
+    if [[ "$resolved" == *$'\t'* ]]; then
+      IFS=$'\t' read -r public_host public_port public_url public_scheme <<< "$resolved"
       return
     fi
     printf '%s\n' "$resolved" >&2
-    domain=''
+    public_host=''
+    public_url_input=''
     public_port=''
   done
-}
-
-resolve_proxy_mode() {
-  if [[ -z "$proxy_mode" ]]; then
-    local choice=''
-    if is_interactive; then
-      note 'HTTPS 方式：'
-      note '1. Hermes Link 自动配置 Caddy（推荐）'
-      note '2. 使用现有反向代理'
-      choice="$(prompt_value '请选择' '1')" || true
-      case "$choice" in
-        1) proxy_mode='caddy' ;;
-        2) proxy_mode='external' ;;
-        *) fail '请选择 1 或 2' ;;
-      esac
-    else
-      proxy_mode='caddy'
-    fi
-  fi
-  [[ "$proxy_mode" == 'caddy' || "$proxy_mode" == 'external' ]] || fail "--proxy-mode must be caddy or external"
 }
 
 port_is_free() {
@@ -493,46 +597,26 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
 PY
 }
 
-resolve_caddy_ports() {
-  [[ "$dry_run" == true || "$proxy_mode" != 'caddy' ]] && return
-  while ! port_is_free "$public_port"; do
-    note "端口 $public_port 已被占用。"
-    if ! is_interactive; then
-      fail "Choose another --public-port or use --proxy-mode external."
-    fi
-    note '请选择：'
-    note '1. 使用其他公网端口'
-    note '2. 使用现有反向代理'
-    note '3. 退出安装'
-    case "$(prompt_value '请选择' '1')" in
-      1)
-        public_port="$(prompt_value '请输入新的公网 HTTPS 端口' '8443')" || fail '未提供端口'
-        resolve_endpoint
-        ;;
-      2) proxy_mode='external'; return ;;
-      *) fail '安装已取消' ;;
-    esac
-  done
-  if ! port_is_free 80; then
-    note '自动 Caddy TLS 需要本机 TCP 80 可用于 HTTP-01 证书验证。'
-    note '请释放端口 80，或选择现有反向代理 / DNS challenge / 已有证书的高级部署方式。'
-    if is_interactive && [[ "$(prompt_value '改用现有反向代理？(y/N)' 'N')" =~ ^[Yy]$ ]]; then
-      proxy_mode='external'
-      return
-    fi
-    fail '无法在当前端口状态下启用自动 Caddy TLS'
+resolve_listener() {
+  if [[ -z "$listen_port" ]]; then
+    if [[ "$public_scheme" == 'http' ]]; then listen_port="$public_port"; else listen_port='18766'; fi
   fi
-}
-
-resolve_internal_bridge_port() {
-  local candidate
-  for ((candidate=INTERNAL_BRIDGE_PORT; candidate<=INTERNAL_BRIDGE_PORT + 10; candidate++)); do
-    if port_is_free "$candidate"; then
-      internal_bridge_port="$candidate"
-      return
+  if [[ ! "$listen_port" =~ ^[0-9]+$ ]] || (( 10#$listen_port < 1024 || 10#$listen_port > 65535 )); then
+    fail "--listen-port must be an unprivileged TCP port in 1024..65535"
+  fi
+  if [[ -z "$listen_host" ]]; then
+    if [[ "$public_scheme" == 'http' ]]; then listen_host='0.0.0.0'; else listen_host='127.0.0.1'; fi
+  fi
+  [[ "$listen_host" == '127.0.0.1' || "$listen_host" == '0.0.0.0' ]] || \
+    fail "--listen-host must be 127.0.0.1 or 0.0.0.0"
+  if [[ "$dry_run" == false ]] && ! port_is_free "$listen_port"; then
+    local existing_listener_port=''
+    if [[ "$existing_install" == true && "$upgrade_existing" == true ]]; then
+      existing_listener_port="$(awk -F= '$1 == "HERMES_LINK_LISTEN_PORT" {print $2; exit}' "$install_dir/.env")"
     fi
-  done
-  fail "No free loopback port was found in the Hermes Link internal range."
+    [[ "$existing_listener_port" == "$listen_port" ]] || \
+      fail "Server HTTP listener port $listen_port is already in use"
+  fi
 }
 
 resolve_agent_context() {
@@ -546,23 +630,41 @@ resolve_agent_context() {
   if [[ "$dry_run" == false ]] && ! getent passwd "$agent_user" >/dev/null; then
     fail "Hermes Agent user does not exist: $agent_user"
   fi
+  agent_home="$(getent passwd "$agent_user" 2>/dev/null | cut -d: -f6 || true)"
+  if [[ -z "$agent_home" && "$dry_run" == true ]]; then
+    agent_home="/home/$agent_user"
+    if [[ "$agent_user" == 'root' ]]; then agent_home='/root'; fi
+  fi
+  [[ -n "$agent_home" ]] || fail "Cannot determine the home directory for $agent_user"
   if [[ -z "$hermes_home" ]]; then
-    local agent_home=''
-    agent_home="$(getent passwd "$agent_user" 2>/dev/null | cut -d: -f6 || true)"
-    if [[ -z "$agent_home" && "$dry_run" == true ]]; then agent_home="/home/$agent_user"; fi
-    [[ -n "$agent_home" ]] || fail "Cannot determine the home directory for $agent_user; pass --hermes-home"
     hermes_home="$agent_home/.hermes"
   fi
   [[ "$hermes_home" == /* ]] || fail '--hermes-home must be an absolute path'
 }
 
 validate_reused_agent_credential() {
-  [[ -n "$reuse_agent_credential" ]] || return
+  [[ -n "$reuse_agent_credential" ]] || return 0
   [[ -f "$reuse_agent_credential" && ! -L "$reuse_agent_credential" ]] || fail "--reuse-agent-credential must be a regular file"
   local ownership=''
   ownership="$(stat -c '%u %a' -- "$reuse_agent_credential")" || fail "Cannot inspect --reuse-agent-credential"
   [[ "$ownership" == '0 600' ]] || fail "--reuse-agent-credential must be owned by root with mode 0600"
   grep -q '^HERMES_LINK_AGENT_TOKEN=.' -- "$reuse_agent_credential" || fail "--reuse-agent-credential does not contain a usable Agent credential"
+}
+
+ensure_mobile_api_credential() {
+  local credential_file="$1"
+  if [[ -f "$credential_file" ]]; then
+    local ownership=''
+    ownership="$(stat -c '%u %a' -- "$credential_file")" || fail 'Cannot inspect the mobile API credential file.'
+    [[ "$ownership" == '0 600' ]] || fail 'The mobile API credential file must be owned by root with mode 0600.'
+    grep -q '^HERMES_LINK_MOBILE_API_TOKEN=.' -- "$credential_file" || \
+      fail 'The mobile API credential file does not contain a usable token.'
+    return
+  fi
+  install -d -m 0700 "$(dirname -- "$credential_file")"
+  local token=''
+  token="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')" || fail 'Could not generate the mobile API credential.'
+  printf 'HERMES_LINK_MOBILE_API_TOKEN=%s\n' "$token" | install -m 0600 /dev/stdin "$credential_file"
 }
 
 select_state_source() {
@@ -583,7 +685,7 @@ select_state_source() {
 }
 
 validate_state_import_dir() {
-  [[ -n "$state_import_dir" ]] || return
+  [[ -n "$state_import_dir" ]] || return 0
   [[ -d "$state_import_dir" && ! -L "$state_import_dir" ]] || fail "--state-import-dir must be a directory"
   state_import_dir="$(cd -P -- "$state_import_dir" && pwd)" || fail "Cannot resolve --state-import-dir"
 
@@ -602,7 +704,7 @@ validate_state_import_dir() {
 }
 
 import_server_state() {
-  [[ -n "$state_import_dir" ]] || return
+  [[ -n "$state_import_dir" ]] || return 0
   local state_name=''
   install -m 0600 -- "$state_identity_source" "$install_dir/data/server/server-identity.json"
   chown 10001:10001 "$install_dir/data/server/server-identity.json"
@@ -619,9 +721,7 @@ import_server_state() {
 }
 
 resolve_endpoint
-resolve_proxy_mode
-resolve_caddy_ports
-resolve_internal_bridge_port
+resolve_listener
 resolve_agent_context
 validate_reused_agent_credential
 validate_state_import_dir
@@ -629,6 +729,28 @@ validate_state_import_dir
 agent_credential_file="$INTERNAL_CREDENTIAL_FILE"
 if [[ -n "$reuse_agent_credential" ]]; then
   agent_credential_file="$reuse_agent_credential"
+elif [[ "$agent_service_scope" == 'user' ]]; then
+  agent_credential_file="$agent_home/.config/hermes-link-server/internal-agent.env"
+fi
+mobile_credential_file="$MOBILE_CREDENTIAL_FILE"
+
+if [[ "$existing_install" == true && "$upgrade_existing" == true ]]; then
+  if [[ "$dry_run" == true ]]; then
+    note "DRY RUN: verify release $version and bootstrap the managed update without changing Server identity or pairing state."
+    exit 0
+  fi
+  [[ "${EUID}" -eq 0 ]] || fail "Run the installer as root, for example with sudo."
+  if [[ -n "$source_dir" ]]; then
+    ensure_mobile_api_credential "$mobile_credential_file"
+    migrate_local_existing_installation
+    exit
+  fi
+  note "Bootstrapping the verified update command for the managed installation at $install_dir."
+  install -m 0755 "$stage_dir/bin/hermes-link" "$install_dir/bin/hermes-link"
+  install -m 0755 "$stage_dir/bin/lib/deployment_helpers.py" "$install_dir/bin/lib/deployment_helpers.py"
+  install -m 0755 "$stage_dir/bin/lib/release_manifest.py" "$install_dir/bin/lib/release_manifest.py"
+  "$install_dir/bin/hermes-link" update --version "$version"
+  exit
 fi
 
 bootstrap_args=(
@@ -654,11 +776,11 @@ if [[ "$dry_run" == true ]]; then
   else
     note "DRY RUN: pull $image."
   fi
-  note "DRY RUN: start the Server on hidden loopback port $internal_bridge_port."
-  if [[ "$proxy_mode" == 'caddy' ]]; then
-    note "DRY RUN: Caddy will serve $public_url and use TCP 80 for HTTP-01 certificate validation."
+  note "DRY RUN: start the Server HTTP listener on $listen_host:$listen_port."
+  if [[ "$public_scheme" == 'http' ]]; then
+    note "DRY RUN: App connects directly to $public_url without TLS; use only a trusted network."
   else
-    note "DRY RUN: external reverse proxy target will be http://127.0.0.1:$internal_bridge_port."
+    note "DRY RUN: external HTTPS proxy is user-managed and must route to http://$listen_host:$listen_port."
   fi
   note "DRY RUN: detected Profile directory names will be enabled automatically after Hermes access is ready."
   exit 0
@@ -677,9 +799,12 @@ install -d -m 0755 "$install_dir"
 cp -a "$stage_dir/." "$install_dir/"
 install -d -m 0700 "$install_dir/data/server"
 chown 10001:10001 "$install_dir/data/server"
-install -d -m 0700 "$install_dir/data/caddy-data" "$install_dir/data/caddy-config" "$install_dir/backups"
+install -d -m 0750 "$install_dir/data/server/model-config"
+chown 0:10001 "$install_dir/data/server/model-config"
+install -d -m 0700 "$install_dir/backups"
 
 import_server_state
+ensure_mobile_api_credential "$mobile_credential_file"
 if [[ -n "$reuse_agent_credential" ]]; then
   note 'Reusing the existing root-only Agent credential; the Agent service was left unchanged.'
 else
@@ -699,25 +824,25 @@ environment_tmp="$(mktemp "$install_dir/.env.XXXXXX")"
   printf 'HERMES_LINK_IMAGE=%s\n' "$image"
   printf 'HERMES_LINK_RELEASE_DOWNLOAD_BASE_URL=%s\n' "$release_download_base_url"
   printf 'HERMES_LINK_RELEASE_API_URL=https://api.github.com/repos/yhvspm/hermes-link-server/releases/latest\n'
-  printf 'HERMES_LINK_PUBLIC_HOST=%s\n' "$domain"
+  printf 'HERMES_LINK_PUBLIC_HOST=%s\n' "$public_host"
   printf 'HERMES_LINK_PUBLIC_PORT=%s\n' "$public_port"
   printf 'HERMES_LINK_PUBLIC_URL=%s\n' "$public_url"
-  printf 'HERMES_LINK_PROXY_MODE=%s\n' "$proxy_mode"
+  printf 'HERMES_LINK_LISTEN_HOST=%s\n' "$listen_host"
+  printf 'HERMES_LINK_LISTEN_PORT=%s\n' "$listen_port"
   printf 'HERMES_LINK_AGENT_HOME_HOST=%s\n' "$hermes_home"
   printf 'HERMES_LINK_PROFILE_IDS=%s\n' "$profile_list"
   printf 'HERMES_LINK_INTERNAL_ENV_FILE=%s\n' "$agent_credential_file"
-  printf 'HERMES_LINK_BRIDGE_PORT=%s\n' "$internal_bridge_port"
+  printf 'HERMES_LINK_MOBILE_ENV_FILE=%s\n' "$mobile_credential_file"
   printf 'HERMES_LINK_FIREWALL_MANAGED=0\n'
 } > "$environment_tmp"
 install -m 0600 "$environment_tmp" "$install_dir/.env"
 rm -f -- "$environment_tmp"
 
 compose=(docker compose --env-file "$install_dir/.env" --project-directory "$install_dir" -f "$install_dir/compose.yaml")
-if [[ "$proxy_mode" == 'caddy' ]]; then compose+=(--profile caddy); fi
 if [[ "$skip_image_pull" == true ]]; then
   docker image inspect "$image" >/dev/null || fail "Local Server image is unavailable: $image"
 else
-  pull_or_import_image
+  pull_or_import_server_image
 fi
 if [[ "$image_loaded_from_archive" == true ]]; then
   "${compose[@]}" up -d --pull never --remove-orphans
@@ -728,7 +853,7 @@ fi
 wait_for_local_health() {
   local attempt
   for attempt in {1..30}; do
-    if curl --fail --silent --max-time 3 "http://127.0.0.1:$internal_bridge_port/health" >/dev/null; then
+    if curl --fail --silent --max-time 3 "http://127.0.0.1:$listen_port/health" >/dev/null; then
       return 0
     fi
     sleep 2
@@ -741,30 +866,15 @@ if ! wait_for_local_health; then
   "$install_dir/bin/hermes-link" doctor || true
   exit 1
 fi
-server_info="$(curl --fail --silent --max-time 5 "http://127.0.0.1:$internal_bridge_port/hermes-link/v1/server-info")"
+server_info="$(curl --fail --silent --max-time 5 "http://127.0.0.1:$listen_port/hermes-link/v1/server-info")"
 IFS=$'\t' read -r gateway_state active_agents server_id cloud_multi_binding <<< "$(printf '%s' "$server_info" | "$python_bin" "$install_dir/bin/lib/deployment_helpers.py" server-info)"
 [[ -n "$server_id" ]] || fail 'Server identity was not created in persistent state'
 
-https_state='External reverse proxy mode'
-if [[ "$proxy_mode" == 'caddy' ]]; then
-  https_state='Waiting for HTTPS'
-  for _attempt in {1..45}; do
-    if curl --fail --silent --max-time 5 "$public_url/hermes-link/v1/server-info" >/dev/null; then
-      https_state='✓'
-      break
-    fi
-    sleep 2
-  done
-  if [[ "$https_state" != '✓' ]]; then
-    note 'Server is healthy, but HTTPS has not been verified. DNS, TCP 80/your public port, or certificate validation needs attention.'
-    "$install_dir/bin/hermes-link" doctor || true
-    exit 1
-  fi
-fi
-
 ln -s "$install_dir/bin/hermes-link" /usr/local/bin/hermes-link
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-  note "Firewall is active. If needed, allow public TCP $public_port yourself; the installer did not change firewall rules."
+  if [[ "$listen_host" == '0.0.0.0' ]]; then
+    note "Firewall is active. Allow TCP $listen_port yourself if the App connects from another device; the installer did not change firewall rules."
+  fi
 fi
 
 note ''
@@ -778,11 +888,16 @@ else
 fi
 note "Agents       ✓ $active_agents"
 note 'Server ID    ✓ Stable'
-if [[ "$proxy_mode" == 'caddy' ]]; then note 'HTTPS        ✓'; else note 'HTTPS        ! External reverse proxy mode'; fi
+if [[ "$public_scheme" == 'http' ]]; then
+  note 'Transport    ! HTTP is unencrypted; use only a trusted network'
+else
+  note 'Transport    ✓ External HTTPS is user-managed'
+fi
 if [[ "$cloud_multi_binding" == 'true' ]]; then note 'Cloud V3     ✓ Supported'; else note 'Cloud V3     ! Identity capability not reported'; fi
 note ''
 note 'App 地址：'
 note "$public_url"
 note ''
 note '下一步：'
-note '打开 Hermes Link App → 设置 → 服务器 → 添加 Hermes'
+note '打开 Hermes Link App → 设置 → 服务器 → 扫码配置'
+"$install_dir/bin/hermes-link" pair || note '二维码生成失败；运行 sudo hermes-link pair 重试。'

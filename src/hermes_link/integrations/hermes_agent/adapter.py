@@ -34,7 +34,6 @@ PROTOCOL_EXACT_PATHS = {
     "/hermes-link/v1/cloud/identity": "/api/mobile/cloud/identity",
     "/hermes-link/v1/cloud/configure": "/api/mobile/cloud/configure",
     "/hermes-link/v1/cloud/binding": "/api/mobile/cloud/binding",
-    "/hermes-link/v1/notifications/direct": "/api/mobile/notifications/stream",
 }
 PROTOCOL_PREFIX_PATHS = {
     "/hermes-link/v1/jobs": "/api/jobs",

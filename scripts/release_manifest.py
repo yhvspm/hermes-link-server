@@ -19,7 +19,6 @@ OFFICIAL_IMAGE_REPOSITORY = "ghcr.io/yhvspm/hermes-link-server"
 RELEASE_ASSET_PATHS = (
     "install.sh",
     "deploy/standard/compose.yaml",
-    "deploy/standard/Caddyfile",
     "deploy/standard/.env.example",
     "deploy/standard/bin/hermes-link",
     "scripts/deployment_helpers.py",
@@ -30,7 +29,6 @@ RELEASE_ASSET_PATHS = (
 RELEASE_DOWNLOAD_ASSET_NAMES = {
     "install.sh": "hermes-link-server-install.sh",
     "deploy/standard/compose.yaml": "hermes-link-server-compose.yaml",
-    "deploy/standard/Caddyfile": "hermes-link-server-Caddyfile",
     "deploy/standard/.env.example": "hermes-link-server-env.example",
     "deploy/standard/bin/hermes-link": "hermes-link-server-cli",
     "scripts/deployment_helpers.py": "hermes-link-server-deployment-helpers.py",

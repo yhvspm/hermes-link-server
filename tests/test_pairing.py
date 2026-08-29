@@ -43,6 +43,14 @@ class PairingStoreTests(unittest.TestCase):
             self.store.exchange(code, now=102)
         self.assertEqual(context.exception.code, "pairing_used")
 
+    def test_ticket_accepts_http_ip_endpoint(self) -> None:
+        ticket = self.store.create_ticket(
+            "http://203.0.113.42:18765",
+            "test-mobile-token-123456",
+            now=100,
+        )
+        self.assertTrue(ticket.pairing_url.startswith("http://203.0.113.42:18765/api/mobile/pair?"))
+
     def test_device_token_scope_and_revoke(self) -> None:
         ticket = self.store.create_ticket(
             "https://hermes.example.test",

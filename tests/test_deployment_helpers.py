@@ -17,20 +17,24 @@ SPEC.loader.exec_module(helpers)
 
 
 class DeploymentHelperTests(unittest.TestCase):
-    def test_public_url_omits_default_https_port(self) -> None:
+    def test_public_url_supports_http_ip_and_https_domain_origins(self) -> None:
         host = helpers.normalize_public_host("Hermes.Example.com.")
         self.assertEqual(host, "hermes.example.com")
-        self.assertEqual(helpers.public_url(host, 443), "https://hermes.example.com")
+        self.assertEqual(helpers.public_url(host, 443, "https"), "https://hermes.example.com")
         self.assertEqual(
-            helpers.public_url(host, helpers.normalize_public_port("18443")),
-            "https://hermes.example.com:18443",
+            helpers.public_url("203.0.113.42", helpers.normalize_public_port("18765")),
+            "http://203.0.113.42:18765",
+        )
+        self.assertEqual(
+            helpers.normalize_public_endpoint("http://203.0.113.42:18765"),
+            ("203.0.113.42", 18765, "http://203.0.113.42:18765", "http"),
         )
 
-    def test_public_endpoint_rejects_ip_and_invalid_port(self) -> None:
-        with self.assertRaises(ValueError):
-            helpers.normalize_public_host("203.0.113.42")
+    def test_public_endpoint_rejects_invalid_port_and_unsafe_url_parts(self) -> None:
         with self.assertRaises(ValueError):
             helpers.normalize_public_port("70000")
+        with self.assertRaises(ValueError):
+            helpers.normalize_public_endpoint("http://user:pass@203.0.113.42")
 
     def test_profile_discovery_reads_names_not_profile_contents(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

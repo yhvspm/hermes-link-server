@@ -104,6 +104,9 @@ class ProtocolTests(unittest.TestCase):
             protocol_to_agent_path("/hermes-link/v1/chat/completions"),
             "/v1/chat/completions",
         )
+        self.assertIsNone(
+            protocol_to_agent_path("/hermes-link/v1/notifications/direct")
+        )
         self.assertIsNone(protocol_to_agent_path("/hermes-link/v1/raw/internal"))
 
     def test_bridge_preserves_session_identity_header(self):
@@ -173,7 +176,7 @@ class ProtocolTests(unittest.TestCase):
             self.assertTrue(str(response["device_token"]).startswith("hmd_"))
 
     def test_bridge_port_defaults_and_rejects_invalid_values(self):
-        from hermes_link.integrations.hermes_agent.bridge import _bridge_port
+        from hermes_link.integrations.hermes_agent.bridge import _bridge_host, _bridge_port
 
         with patch.dict("os.environ", {}, clear=True):
             self.assertEqual(_bridge_port(), 8765)
@@ -182,6 +185,11 @@ class ProtocolTests(unittest.TestCase):
         with patch.dict("os.environ", {"HERMES_LINK_BRIDGE_PORT": "0"}, clear=True):
             with self.assertRaises(RuntimeError):
                 _bridge_port()
+        with patch.dict("os.environ", {"HERMES_LINK_BIND_HOST": "0.0.0.0"}, clear=True):
+            self.assertEqual(_bridge_host(), "0.0.0.0")
+        with patch.dict("os.environ", {"HERMES_LINK_BIND_HOST": "192.0.2.10"}, clear=True):
+            with self.assertRaises(RuntimeError):
+                _bridge_host()
 
     def test_server_discovers_profile_ids_without_reading_profile_contents(self):
         from hermes_link.integrations.hermes_agent.bridge import discover_profile_ids
@@ -208,6 +216,61 @@ class ProtocolTests(unittest.TestCase):
             clear=True,
         ):
             self.assertEqual(discover_profile_ids(Path("/restricted")), ["default", "cto"])
+
+    def test_model_config_paths_are_profile_scoped(self):
+        from hermes_link.integrations.hermes_agent.bridge import _model_config_profile_id
+
+        self.assertEqual(
+            _model_config_profile_id("/hermes-link/v1/models/config"),
+            "default",
+        )
+        self.assertEqual(
+            _model_config_profile_id(
+                "/hermes-link/v1/profiles/work/models/config"
+            ),
+            "work",
+        )
+        self.assertEqual(
+            _model_config_profile_id(
+                "/hermes-link/v1/profiles/bad%20profile/models/config"
+            ),
+            "",
+        )
+        self.assertIsNone(
+            _model_config_profile_id("/hermes-link/v1/profiles/work/models")
+        )
+
+    def test_model_config_reader_returns_safe_fields_only(self):
+        from hermes_link.integrations.hermes_agent.bridge import _read_model_config
+
+        with tempfile.TemporaryDirectory() as directory:
+            hermes_home = Path(directory)
+            (hermes_home / "default.json").write_text(
+                """{
+  "profile": "default",
+  "model": "gpt-test",
+  "provider": "openai",
+  "max_tokens": 4096,
+  "reasoning_effort": "high",
+  "service_tier": "priority",
+  "api_key": "must-not-leak"
+}""",
+                encoding="utf-8",
+            )
+
+            result = _read_model_config("default", hermes_home)
+
+        self.assertEqual(
+            result,
+            {
+                "profile": "default",
+                "model": "gpt-test",
+                "provider": "openai",
+                "max_tokens": 4096,
+                "reasoning_effort": "high",
+                "service_tier": "priority",
+            },
+        )
 
     def test_server_redaction_fallback_does_not_require_agent_package(self):
         self.assertNotIn("example-token-value", redact_sensitive_text("token=example-token-value"))

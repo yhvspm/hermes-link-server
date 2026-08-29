@@ -4,15 +4,17 @@ umask 077
 
 usage() {
   cat <<'EOF'
-Usage: sudo ./scripts/docker-deploy.sh --public-base-url https://link.example.com[:port] [options]
+Usage: sudo ./scripts/docker-deploy.sh --public-base-url http://IP-or-host[:port] [options]
 
-Runs the Server and Caddy proxy with host networking so the Bridge can keep
-Hermes Agent on 127.0.0.1. The default path creates and injects a dedicated
-root-only Hermes Link credential; it never asks for or prints an Agent token.
+Runs the Server directly over HTTP with host networking while Hermes Agent stays
+on 127.0.0.1. The default path creates and injects a dedicated
+private Hermes Link credential; it never asks for or prints an Agent token.
+For a user-scoped Agent service, the credential is stored under that user's
+private configuration directory.
 Docker host networking requires Linux.
 
 Options:
-  --port PORT         HTTPS listener port (default: inferred from URL or 443)
+  --port PORT         Direct HTTP listener port (must match the URL; 1024..65535)
   --server-env PATH   Optional existing Server settings file (advanced compatibility)
   --hermes-home PATH  Host Hermes metadata directory (default: <agent home>/.hermes)
   --agent-service NAME Hermes Agent systemd unit (default: hermes-gateway.service)
@@ -26,8 +28,6 @@ Options:
   --rotate             Rotate the dedicated credential and recreate the Server container
   --profiles LIST     Pairing Profile scope (default: default)
   --ttl SECONDS       Pairing lifetime, 30..3600 (default: 600)
-  --bridge-port PORT  Loopback Bridge port (default: 8765)
-  --server-only       Start only the Server container; use for isolated validation
   --dry-run           Validate inputs and render the resolved Compose plan only
   --skip-pairing-qr   Do not render the initial pairing QR code
 EOF
@@ -49,10 +49,9 @@ ttl='600'
 dry_run=false
 render_qr=true
 python_bin="${HERMES_LINK_PYTHON:-python3}"
-bridge_port='8765'
-server_only=false
 rotate=false
 parallel_agent_credential=false
+agent_home=''
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -69,8 +68,6 @@ while [[ $# -gt 0 ]]; do
     --rotate) rotate=true; shift ;;
     --profiles) profiles="${2:-}"; profiles_explicit=true; shift 2 ;;
     --ttl) ttl="${2:-}"; shift 2 ;;
-    --bridge-port) bridge_port="${2:-}"; shift 2 ;;
-    --server-only) server_only=true; shift ;;
     --dry-run) dry_run=true; shift ;;
     --skip-pairing-qr) render_qr=false; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -85,39 +82,30 @@ fi
 
 validation="$("$python_bin" - "$public_base_url" "$listen_port" <<'PY'
 from __future__ import annotations
-import ipaddress
 import sys
 from urllib.parse import urlparse
 
 raw, requested_port = sys.argv[1], sys.argv[2]
 parsed = urlparse(raw)
-if parsed.scheme != "https" or parsed.username or parsed.password or parsed.path not in ("", "/") or parsed.query or parsed.fragment:
-    raise SystemExit("public base URL must be an HTTPS origin without credentials, path, query, or fragment")
+if parsed.scheme != "http" or parsed.username or parsed.password or parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+    raise SystemExit("public base URL must be an HTTP origin without credentials, path, query, or fragment")
 if not parsed.hostname:
-    raise SystemExit("public base URL must contain a DNS hostname")
+    raise SystemExit("public base URL must contain an IP address or hostname")
 try:
-    ipaddress.ip_address(parsed.hostname)
-except ValueError:
-    pass
-else:
-    raise SystemExit("public base URL must use a DNS hostname, not an IP address")
-try:
-    url_port = parsed.port or 443
+    url_port = parsed.port
 except ValueError as error:
     raise SystemExit("public base URL has an invalid port") from error
+if url_port is None:
+    raise SystemExit("public base URL must include an unprivileged TCP port")
 port = int(requested_port or url_port)
-if not 1 <= port <= 65535:
-    raise SystemExit("port must be in 1..65535")
+if not 1024 <= port <= 65535:
+    raise SystemExit("port must be in 1024..65535 because the Server runs unprivileged")
 if port != url_port:
-    raise SystemExit("--port must match the port in --public-base-url (or 443 when omitted)")
-print(f"{parsed.hostname}\t{port}")
+    raise SystemExit("--port must match the port in --public-base-url")
+print(port)
 PY
 )"
-IFS=$'\t' read -r public_host listen_port <<< "$validation"
-if [[ ! "$bridge_port" =~ ^[0-9]+$ ]] || (( bridge_port < 1 || bridge_port > 65535 )); then
-  echo "--bridge-port must be in 1..65535" >&2
-  exit 2
-fi
+listen_port="$validation"
 
 if [[ ! -f "$repo_dir/deploy/docker/compose.yaml" ]]; then
   echo "Docker deployment assets are missing from $repo_dir" >&2
@@ -129,7 +117,7 @@ if [[ "$dry_run" == false ]]; then
     exit 1
   fi
   if [[ "${EUID}" -ne 0 ]]; then
-    echo "Run Docker deployment as root so the generated internal credential remains root-only." >&2
+    echo "Run Docker deployment as root so Docker can manage the host-network deployment." >&2
     exit 1
   fi
   if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
@@ -150,6 +138,18 @@ if [[ "$dry_run" == false ]]; then
   bash "$script_dir/bootstrap-hermes-agent-access.sh" "${bootstrap_args[@]}"
 fi
 internal_env='/etc/hermes-link-server/internal-agent.env'
+if [[ "$agent_service_scope" == 'user' ]]; then
+  if [[ -z "$agent_user" ]]; then agent_user="${SUDO_USER:-}"; fi
+  if [[ "$dry_run" == true && -z "$agent_user" ]]; then agent_user='<sudo-caller>'; fi
+  if [[ "$dry_run" == false ]]; then
+    agent_home="$(getent passwd "$agent_user" | cut -d: -f6)"
+    [[ -n "$agent_home" ]] || { echo "Cannot determine home directory for $agent_user" >&2; exit 1; }
+  else
+    agent_home="/home/$agent_user"
+    if [[ "$agent_user" == 'root' ]]; then agent_home='/root'; fi
+  fi
+  internal_env="$agent_home/.config/hermes-link-server/internal-agent.env"
+fi
 if [[ -z "$hermes_home" && "$dry_run" == false ]]; then
   hermes_home="$(sed -n 's/^HERMES_HOME=//p' "$internal_env")"
 fi
@@ -180,16 +180,18 @@ if [[ "$dry_run" == true ]]; then
   export HERMES_LINK_INTERNAL_ENV_FILE='/dev/null'
 fi
 export HERMES_HOME_HOST_PATH="$hermes_home"
-export HERMES_LINK_PUBLIC_HOST="$public_host"
-export HERMES_LINK_LISTEN_PORT="$listen_port"
-export HERMES_LINK_BRIDGE_PORT="$bridge_port"
+export HERMES_LINK_BIND_HOST='0.0.0.0'
+export HERMES_LINK_BRIDGE_PORT="$listen_port"
 
 if [[ "$dry_run" == true ]]; then
   printf '%s\n' \
-    "DRY RUN: Docker host networking will keep Hermes Agent at 127.0.0.1, bind the Bridge to 127.0.0.1:$bridge_port, and use HTTPS $listen_port when the proxy profile is enabled." \
-    "DRY RUN: Caddy will obtain/use a certificate for $public_host; HTTP-01 requires inbound TCP 80." \
+    "DRY RUN: Docker host networking keeps Hermes Agent at 127.0.0.1 and binds the Server HTTP listener to 0.0.0.0:$listen_port." \
+    "DRY RUN: App connects directly to $public_base_url without TLS; use only a trusted network." \
     "DRY RUN: Server state uses a named volume; Hermes metadata is mounted read-only." \
     "DRY RUN: pairing QR after healthy startup: $render_qr."
+  if [[ "$agent_service_scope" == 'user' ]]; then
+    echo "DRY RUN: Docker will read the user-scoped private Agent credential at $internal_env."
+  fi
   if [[ "$rotate" == true ]]; then echo "DRY RUN: recreate the Server container after Agent credential rotation."; fi
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     docker compose --project-directory "$repo_dir" -f "$repo_dir/deploy/docker/compose.yaml" config >/dev/null
@@ -200,19 +202,13 @@ if [[ "$dry_run" == true ]]; then
   exit 0
 fi
 
-if [[ "$server_only" == true ]]; then
-  compose_up=(docker compose --project-directory "$repo_dir" -f "$repo_dir/deploy/docker/compose.yaml" up -d --build)
-  if [[ "$rotate" == true ]]; then compose_up+=(--force-recreate); fi
-  "${compose_up[@]}" server log-exporter
-else
-  compose_up=(docker compose --profile proxy --project-directory "$repo_dir" -f "$repo_dir/deploy/docker/compose.yaml" up -d --build)
-  if [[ "$rotate" == true ]]; then compose_up+=(--force-recreate); fi
-  "${compose_up[@]}"
-fi
+compose_up=(docker compose --project-directory "$repo_dir" -f "$repo_dir/deploy/docker/compose.yaml" up -d --build)
+if [[ "$rotate" == true ]]; then compose_up+=(--force-recreate); fi
+"${compose_up[@]}"
 docker compose --project-directory "$repo_dir" -f "$repo_dir/deploy/docker/compose.yaml" exec -T server \
-  python -c "from urllib.request import urlopen; assert urlopen('http://127.0.0.1:${bridge_port}/health', timeout=5).status == 200"
+  python -c "from urllib.request import urlopen; assert urlopen('http://127.0.0.1:${listen_port}/health', timeout=5).status == 200"
 
-if [[ "$render_qr" == true && "$server_only" == false ]]; then
+if [[ "$render_qr" == true ]]; then
   pairing_token_env='HERMES_LINK_MOBILE_API_TOKEN'
   if [[ "$parallel_agent_credential" == true ]]; then
     pairing_token_env='HERMES_LINK_AGENT_TOKEN'
@@ -224,10 +220,6 @@ if [[ "$render_qr" == true && "$server_only" == false ]]; then
       --ttl "$ttl" \
       --token-env "$pairing_token_env" \
       --qr
-fi
-
-if [[ "$render_qr" == true && "$server_only" == true ]]; then
-  echo "Server-only mode does not render a pairing QR because no public HTTPS proxy is started."
 fi
 
 echo "Hermes Link Server is running at $public_base_url."

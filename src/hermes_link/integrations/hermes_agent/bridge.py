@@ -9,22 +9,22 @@ import os
 import re
 import sqlite3
 import threading
+import time
 import uuid
 from collections import deque
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
-
-import yaml
 
 try:
     from agent.redact import redact_sensitive_text
 except ImportError:
     from hermes_link.security.redaction import redact_sensitive_text
 from hermes_link.api.capabilities import server_info
+from hermes_link.api.attachments import ChatAttachmentError, normalize_chat_attachment_request
 from hermes_link.identity import (
     clear_cloud_config,
     configure_cloud,
@@ -42,11 +42,21 @@ from hermes_link.integrations.hermes_agent.adapter import (
     protocol_to_agent_path,
 )
 from hermes_link.notifications.cloud_sender import CloudEventSender, CloudTransportError
+from hermes_link.notifications.direct import DirectNotificationStore
 from hermes_link.pairing.http import exchange_pairing_payload
 from hermes_link.pairing.store import device_profile_ids, revoke_device_token
 
 
-HOST = "127.0.0.1"
+def _bridge_host() -> str:
+    """Return the explicitly supported listening address for the public facade."""
+
+    host = os.environ.get("HERMES_LINK_BIND_HOST", "127.0.0.1").strip()
+    if host not in {"127.0.0.1", "0.0.0.0"}:
+        raise RuntimeError("HERMES_LINK_BIND_HOST must be 127.0.0.1 or 0.0.0.0")
+    return host
+
+
+HOST = _bridge_host()
 
 
 def _bridge_port() -> int:
@@ -67,6 +77,18 @@ HERMES_HOME = Path(
         os.environ.get("HERMES_HOME", "/root/.hermes"),
     )
 )
+MODEL_CONFIG_DIRECTORY = Path(
+    os.environ.get(
+        "HERMES_LINK_MODEL_CONFIG_DIR",
+        "/var/lib/hermes-link-server/model-config",
+    )
+)
+DIRECT_NOTIFICATION_DATABASE = Path(
+    os.environ.get(
+        "HERMES_LINK_DIRECT_EVENT_DB",
+        "/var/lib/hermes-link-server/direct-events.db",
+    )
+)
 REDACTED_LOG_DIRECTORY = Path(
     os.environ.get("HERMES_LINK_REDACTED_LOG_DIR", "").strip()
 )
@@ -81,11 +103,20 @@ LOG_PATTERN = re.compile(
     r"(?:\s+\[[^\]]+\])?\s+(?P<source>[^:]+):\s*(?P<message>.*)$"
 )
 PROFILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+MODEL_CONFIG_PROFILE_PATTERN = re.compile(
+    r"^/hermes-link/v1/profiles/([^/]+)/models/config$"
+)
 TRACE_TOOL_PATTERN = re.compile(r"^[a-z0-9._-]{1,40}$")
 TRACE_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 TRACE_DETAIL_MAX_LENGTH = 280
 PROXY_UPSTREAM_TIMEOUT_SECONDS = 300
 CHAT_STREAM_UPSTREAM_TIMEOUT_SECONDS = 3600
+DIRECT_NOTIFICATION_MAX_WAIT_SECONDS = 25.0
+DIRECT_NOTIFICATION_KEEPALIVE_SECONDS = 10.0
+DIRECT_NOTIFICATION_POLL_SECONDS = 0.25
+DIRECT_NOTIFICATION_BATCH_LIMIT = 100
+_DIRECT_NOTIFICATION_STORE: DirectNotificationStore | None = None
+_DIRECT_NOTIFICATION_STORE_LOCK = threading.Lock()
 
 
 def discover_profile_ids(hermes_home: Path = HERMES_HOME) -> list[str]:
@@ -114,6 +145,18 @@ def discover_profile_ids(hermes_home: Path = HERMES_HOME) -> list[str]:
         ):
             profile_ids.append(profile_id)
     return profile_ids
+
+
+def _direct_notification_store() -> DirectNotificationStore:
+    """Create the Server-owned DIRECT store only when notification delivery is used."""
+
+    global _DIRECT_NOTIFICATION_STORE
+    with _DIRECT_NOTIFICATION_STORE_LOCK:
+        if _DIRECT_NOTIFICATION_STORE is None:
+            _DIRECT_NOTIFICATION_STORE = DirectNotificationStore(
+                DIRECT_NOTIFICATION_DATABASE
+            )
+        return _DIRECT_NOTIFICATION_STORE
 
 
 def _read_tail(path: Path, limit: int) -> list[str]:
@@ -198,29 +241,41 @@ def _read_tasks(limit: int) -> list[dict[str, object]]:
         connection.close()
 
 
-def _read_model_config(profile_id: str) -> dict[str, str] | None:
-    config_path = (
-        HERMES_HOME / "config.yaml"
-        if profile_id == "default"
-        else HERMES_HOME / "profiles" / profile_id / "config.yaml"
-    )
-    if not config_path.is_file():
+def _model_config_profile_id(protocol_path: str) -> str | None:
+    if protocol_path == "/hermes-link/v1/models/config":
+        return "default"
+    match = MODEL_CONFIG_PROFILE_PATTERN.fullmatch(protocol_path)
+    if match is None:
         return None
-    with config_path.open("r", encoding="utf-8") as handle:
-        payload = yaml.safe_load(handle) or {}
-    model_config = payload.get("model", {})
-    if isinstance(model_config, dict):
-        model = str(
-            model_config.get("default") or model_config.get("name") or ""
-        ).strip()
-        provider = str(model_config.get("provider") or "").strip()
-    else:
-        model = str(model_config or "").strip()
-        provider = ""
+    profile_id = unquote(match.group(1)).strip()
+    return profile_id if PROFILE_ID_PATTERN.fullmatch(profile_id) else ""
+
+
+def _read_model_config(
+    profile_id: str,
+    model_config_directory: Path = MODEL_CONFIG_DIRECTORY,
+) -> dict[str, object] | None:
+    if not PROFILE_ID_PATTERN.fullmatch(profile_id):
+        return None
+    snapshot_path = model_config_directory / f"{profile_id}.json"
+    try:
+        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    if not isinstance(payload, dict):
+        raise ValueError("model configuration snapshot must be an object")
+    max_tokens = payload.get("max_tokens", 0)
     return {
         "profile": profile_id,
-        "model": model[:200],
-        "provider": provider[:100],
+        "model": str(payload.get("model") or "").strip()[:200],
+        "provider": str(payload.get("provider") or "").strip()[:100],
+        "max_tokens": (
+            max_tokens
+            if isinstance(max_tokens, int) and not isinstance(max_tokens, bool)
+            else 0
+        ),
+        "reasoning_effort": str(payload.get("reasoning_effort") or "").strip()[:20],
+        "service_tier": str(payload.get("service_tier") or "").strip()[:20],
     }
 
 
@@ -360,11 +415,36 @@ def _relay_chat_stream(
     return chat_terminal_state
 
 
-def _publish_cloud_chat_completed(profile_id: str, session_id: str) -> None:
-    """Publish a content-free Cloud event after a completed chat stream."""
+def _chat_completed_event(profile_id: str, session_id: str) -> dict[str, str] | None:
+    """Build the one minimal event shared by DIRECT and optional Cloud delivery."""
 
-    if not profile_id or not session_id:
+    profile = str(profile_id or "").strip()
+    session = str(session_id or "").strip()
+    if not PROFILE_ID_PATTERN.fullmatch(profile) or not session:
+        return None
+    run_id = f"run_{uuid.uuid4().hex}"
+    return {
+        "event_id": f"evt_{uuid.uuid4().hex}",
+        "event_type": "chat.completed",
+        "profile_id": profile,
+        "session_id": session,
+        "run_id": run_id,
+        "dedupe_key": f"chat:{session}:{run_id}",
+    }
+
+
+def _publish_direct_event(event: dict[str, str]) -> None:
+    """Persist a content-free Event Protocol v1 record for paired devices."""
+
+    try:
+        _direct_notification_store().publish(event)
+    except (OSError, RuntimeError, ValueError, sqlite3.Error):
         return
+
+
+def _publish_cloud_event(event: dict[str, str]) -> None:
+    """Publish one already-validated event through optional Cloud delivery."""
+
     try:
         config = load_cloud_config()
         if not config:
@@ -372,32 +452,34 @@ def _publish_cloud_chat_completed(profile_id: str, session_id: str) -> None:
         identity = get_or_create_identity()
         if config.get("server_id") != identity["server_id"]:
             return
-        run_id = f"run_{uuid.uuid4().hex}"
+        outbound_url = os.environ.get("HERMES_LINK_CLOUD_OUTBOUND_URL", "").strip()
         CloudEventSender(
-            config["cloud_url"],
+            outbound_url or config["cloud_url"],
             identity["server_id"],
             identity["private_key_pem"],
-        ).publish(
-            {
-                "event_id": f"evt_{uuid.uuid4().hex}",
-                "event_type": "chat.completed",
-                "profile_id": profile_id,
-                "session_id": session_id,
-                "run_id": run_id,
-                "dedupe_key": f"chat:{session_id}:{run_id}",
-            },
-            config["installation_id"],
-        )
+        ).publish(event, config["installation_id"])
     except (CloudTransportError, KeyError, OSError, RuntimeError, ValueError):
         return
 
 
-def _schedule_cloud_chat_completed(profile_id: str, session_id: str) -> None:
-    if not profile_id or not session_id:
+def _publish_cloud_chat_completed(profile_id: str, session_id: str) -> None:
+    """Compatibility helper retained for the Cloud-only execution trace check."""
+
+    event = _chat_completed_event(profile_id, session_id)
+    if event is not None:
+        _publish_cloud_event(event)
+
+
+def _publish_chat_completed(profile_id: str, session_id: str) -> None:
+    """Publish a terminal chat event without depending on Hermes Agent internals."""
+
+    event = _chat_completed_event(profile_id, session_id)
+    if event is None:
         return
+    _publish_direct_event(event)
     threading.Thread(
-        target=_publish_cloud_chat_completed,
-        args=(profile_id, session_id),
+        target=_publish_cloud_event,
+        args=(event,),
         daemon=True,
     ).start()
 
@@ -431,6 +513,142 @@ class HermesLinkHandler(BaseHTTPRequestHandler):
             return None
         return discover_profile_ids()
 
+    def _direct_notification_profiles(self) -> list[str] | None:
+        """Return only the current Profiles authorized for one DIRECT stream."""
+
+        authorized_profiles = self._cloud_control_profiles()
+        if authorized_profiles is None:
+            return None
+        visible_profiles = discover_profile_ids()
+        if not authorized_profiles:
+            return visible_profiles
+        return [
+            profile_id
+            for profile_id in authorized_profiles
+            if profile_id in visible_profiles
+        ]
+
+    def _send_direct_notification_stream(self, parsed: object) -> None:
+        """Serve Server-owned, Profile-scoped Event Protocol v1 over SSE."""
+
+        profiles = self._direct_notification_profiles()
+        if profiles is None:
+            self._send_json(
+                401,
+                {
+                    "error": {
+                        "message": "Hermes Link notification authorization failed",
+                        "code": "notification_unauthorized",
+                    }
+                },
+            )
+            return
+        if not profiles:
+            self._send_json(
+                403,
+                {
+                    "error": {
+                        "message": "No current Hermes Profile is authorized for notifications",
+                        "code": "notification_profile_forbidden",
+                    }
+                },
+            )
+            return
+        query = parse_qs(parsed.query, keep_blank_values=True)  # type: ignore[attr-defined]
+        if set(query) - {"after"} or len(query.get("after", [])) > 1:
+            self._send_json(
+                400,
+                {
+                    "error": {
+                        "message": "Hermes Link notification cursor is invalid",
+                        "code": "notification_cursor_invalid",
+                    }
+                },
+            )
+            return
+        after_event_id = str(query.get("after", [""])[0]).strip()
+        if not after_event_id:
+            after_event_id = str(self.headers.get("Last-Event-ID", "")).strip()
+        try:
+            store = _direct_notification_store()
+            store.read_after_event_id(profiles, after_event_id, limit=1)
+        except ValueError:
+            self._send_json(
+                400,
+                {
+                    "error": {
+                        "message": "Hermes Link notification cursor is invalid",
+                        "code": "notification_cursor_invalid",
+                    }
+                },
+            )
+            return
+        except (OSError, sqlite3.Error):
+            self._send_json(
+                503,
+                {
+                    "error": {
+                        "message": "Hermes Link notifications are unavailable",
+                        "code": "notification_unavailable",
+                    }
+                },
+            )
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        cursor = after_event_id
+        deadline = time.monotonic() + DIRECT_NOTIFICATION_MAX_WAIT_SECONDS
+        next_keepalive = time.monotonic() + DIRECT_NOTIFICATION_KEEPALIVE_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                events = store.read_after_event_id(
+                    profiles,
+                    cursor,
+                    limit=DIRECT_NOTIFICATION_BATCH_LIMIT,
+                )
+            except (OSError, sqlite3.Error):
+                return
+            if events:
+                for event in events:
+                    event_id = str(event.get("event_id", "")).strip()
+                    if not event_id:
+                        continue
+                    payload = {
+                        name: value
+                        for name, value in event.items()
+                        if name != "sequence"
+                    }
+                    encoded = json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    try:
+                        self.wfile.write(
+                            f"id: {event_id}\nevent: hermes.notification\ndata: ".encode("utf-8")
+                            + encoded
+                            + b"\n\n"
+                        )
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                    cursor = event_id
+                continue
+            now = time.monotonic()
+            if now >= next_keepalive:
+                try:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                except OSError:
+                    return
+                next_keepalive = now + DIRECT_NOTIFICATION_KEEPALIVE_SECONDS
+            time.sleep(DIRECT_NOTIFICATION_POLL_SECONDS)
+
     def _read_local_json(self, *, limit: int = 16 * 1024) -> dict[str, object] | None:
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
@@ -449,6 +667,88 @@ class HermesLinkHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": {"message": "Cloud payload must be an object", "code": "cloud_request_invalid"}})
             return None
         return payload
+
+    def _authorize_model_config(self, protocol_path: str) -> bool:
+        try:
+            prepare_agent_headers(self.headers, protocol_path)
+        except DeviceAuthorizationError as error:
+            self._send_json(
+                error.status,
+                {"error": {"message": error.message, "code": error.code}},
+            )
+            return False
+        token = _bearer_token(self.headers)
+        if token.startswith("hmd_"):
+            return True
+        expected = (
+            os.environ.get("HERMES_LINK_AGENT_TOKEN", "").strip()
+            or os.environ.get("HERMES_LINK_MOBILE_API_TOKEN", "").strip()
+        )
+        if len(expected) >= 8 and token and hmac.compare_digest(token, expected):
+            return True
+        self._send_json(
+            401,
+            {
+                "error": {
+                    "message": "Hermes Link model configuration authorization failed",
+                    "code": "model_config_unauthorized",
+                }
+            },
+        )
+        return False
+
+    def _send_model_config(self, profile_id: str, protocol_path: str) -> None:
+        if not self._authorize_model_config(protocol_path):
+            return
+        if profile_id not in discover_profile_ids():
+            self._send_json(
+                404,
+                {
+                    "error": {
+                        "message": "Hermes profile was not found",
+                        "code": "profile_not_found",
+                    }
+                },
+            )
+            return
+        try:
+            model_config = _read_model_config(profile_id)
+        except (OSError, ValueError):
+            self._send_json(
+                503,
+                {
+                    "error": {
+                        "message": "Hermes Agent model configuration is unavailable",
+                        "code": "model_config_unavailable",
+                    }
+                },
+            )
+            return
+        if model_config is None:
+            self._send_json(
+                404,
+                {
+                    "error": {
+                        "message": "Hermes profile was not found",
+                        "code": "profile_not_found",
+                    }
+                },
+            )
+            return
+        self._send_json(200, model_config)
+
+    def _reject_model_config_write(self, protocol_path: str) -> None:
+        if not self._authorize_model_config(protocol_path):
+            return
+        self._send_json(
+            501,
+            {
+                "error": {
+                    "message": "Model configuration updates are unavailable for this Hermes Agent release",
+                    "code": "model_config_write_unsupported",
+                }
+            },
+        )
 
     def _write_chat_stream_chunk(self, chunk: bytes) -> bool:
         try:
@@ -487,8 +787,17 @@ class HermesLinkHandler(BaseHTTPRequestHandler):
             )
             return True
         headers["Accept"] = self.headers.get("Accept", "application/json")
-        request = Request(target, data=body, headers=headers, method=self.command)
         is_chat_request = path.endswith("/v1/chat/completions")
+        if is_chat_request:
+            try:
+                body = normalize_chat_attachment_request(body)
+            except ChatAttachmentError as error:
+                self._send_json(
+                    400,
+                    {"error": {"message": error.message, "code": error.code}},
+                )
+                return True
+        request = Request(target, data=body, headers=headers, method=self.command)
         try:
             response = urlopen(
                 request,
@@ -548,7 +857,7 @@ class HermesLinkHandler(BaseHTTPRequestHandler):
         finally:
             response.close()
         if is_chat_stream and chat_terminal_state == "completed":
-            _schedule_cloud_chat_completed(
+            _publish_chat_completed(
                 _profile_id_for_protocol_path(parsed.path),  # type: ignore[attr-defined]
                 str(self.headers.get("X-Hermes-Session-Id", "")).strip(),
             )
@@ -556,6 +865,24 @@ class HermesLinkHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/hermes-link/v1/notifications/direct":
+            self._send_direct_notification_stream(parsed)
+            return
+        model_config_profile = _model_config_profile_id(parsed.path)
+        if model_config_profile is not None:
+            if not model_config_profile:
+                self._send_json(
+                    400,
+                    {
+                        "error": {
+                            "message": "Invalid Hermes profile",
+                            "code": "profile_invalid",
+                        }
+                    },
+                )
+                return
+            self._send_model_config(model_config_profile, parsed.path)
+            return
         if parsed.path == "/hermes-link/v1/server-info":
             adapter = HermesAgentAdapter(
                 os.environ.get("HERMES_AGENT_BASE_URL", "http://127.0.0.1:8642")
@@ -615,11 +942,7 @@ class HermesLinkHandler(BaseHTTPRequestHandler):
             if not PROFILE_ID_PATTERN.fullmatch(profile_id):
                 self._send_json(400, {"error": "Invalid profile"})
                 return
-            model_config = _read_model_config(profile_id)
-            if model_config is None:
-                self._send_json(404, {"error": "Profile not found"})
-                return
-            self._send_json(200, model_config)
+            self._send_model_config(profile_id, parsed.path)
             return
         if parsed.path == "/hermes-link/v1/logs":
             query = parse_qs(parsed.query)
@@ -657,6 +980,29 @@ class HermesLinkHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        model_config_profile = _model_config_profile_id(parsed.path)
+        if model_config_profile is not None:
+            if not model_config_profile:
+                self._send_json(
+                    400,
+                    {
+                        "error": {
+                            "message": "Invalid Hermes profile",
+                            "code": "profile_invalid",
+                        }
+                    },
+                )
+                return
+            self._reject_model_config_write(parsed.path)
+            return
+        if parsed.path == "/hermes-link/v1/model-config":
+            query = parse_qs(parsed.query)
+            profile_id = query.get("profile", ["default"])[0].strip()
+            if not PROFILE_ID_PATTERN.fullmatch(profile_id):
+                self._send_json(400, {"error": "Invalid profile"})
+                return
+            self._reject_model_config_write(parsed.path)
+            return
         if parsed.path == "/hermes-link/v1/cloud/attestation":
             profiles = self._cloud_control_profiles()
             if profiles is None:

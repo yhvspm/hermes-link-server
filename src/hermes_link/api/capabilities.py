@@ -18,6 +18,7 @@ DEFAULT_FEATURES: dict[str, bool] = {
     "directNotifications": True,
     "cloudNotifications": True,
     "cloudMultiBinding": False,
+    "chatAttachments": True,
 }
 
 

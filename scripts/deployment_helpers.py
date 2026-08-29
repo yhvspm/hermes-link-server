@@ -15,6 +15,7 @@ import re
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 PROFILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -23,7 +24,7 @@ HOST_LABEL_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 
 def normalize_public_host(value: str) -> str:
-    """Return a normalized DNS hostname suitable for public HTTPS."""
+    """Return a normalized DNS hostname or IP address for the App endpoint."""
 
     raw = str(value).strip().rstrip(".")
     if not raw:
@@ -33,13 +34,13 @@ def normalize_public_host(value: str) -> str:
     except ValueError:
         pass
     else:
-        raise ValueError("domain must be a DNS hostname, not an IP address")
+        return ipaddress.ip_address(raw).compressed
     try:
         host = raw.encode("idna").decode("ascii").lower()
     except UnicodeError as error:
         raise ValueError("domain is not a valid DNS hostname") from error
     if len(host) > 253 or "." not in host:
-        raise ValueError("domain must be a public DNS hostname")
+        raise ValueError("host must be a DNS hostname or IP address")
     labels = host.split(".")
     if any(not HOST_LABEL_PATTERN.fullmatch(label) for label in labels):
         raise ValueError("domain is not a valid DNS hostname")
@@ -58,10 +59,48 @@ def normalize_public_port(value: str | int) -> int:
     return port
 
 
-def public_url(host: str, port: int) -> str:
-    """Build the App-facing origin, omitting the default HTTPS port."""
+def normalize_public_scheme(value: str) -> str:
+    scheme = str(value).strip().lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError("endpoint scheme must be http or https")
+    return scheme
 
-    return f"https://{host}" if port == 443 else f"https://{host}:{port}"
+
+def public_url(host: str, port: int, scheme: str = "http") -> str:
+    """Build the App-facing origin, omitting only the scheme default port."""
+
+    normalized_scheme = normalize_public_scheme(scheme)
+    normalized_host = normalize_public_host(host)
+    rendered_host = f"[{normalized_host}]" if ":" in normalized_host else normalized_host
+    default_port = 80 if normalized_scheme == "http" else 443
+    return (
+        f"{normalized_scheme}://{rendered_host}"
+        if port == default_port
+        else f"{normalized_scheme}://{rendered_host}:{port}"
+    )
+
+
+def normalize_public_endpoint(value: str, requested_port: str | int | None = None) -> tuple[str, int, str, str]:
+    raw = str(value).strip()
+    try:
+        parsed = urlsplit(raw)
+    except ValueError as error:
+        raise ValueError("endpoint URL is invalid") from error
+    scheme = normalize_public_scheme(parsed.scheme)
+    if parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in {"", "/"}:
+        raise ValueError("endpoint URL must be an origin without credentials, path, query, or fragment")
+    if not parsed.hostname:
+        raise ValueError("endpoint URL must contain a hostname or IP address")
+    host = normalize_public_host(parsed.hostname)
+    try:
+        parsed_port = parsed.port
+    except ValueError as error:
+        raise ValueError("endpoint URL has an invalid port") from error
+    default_port = 80 if scheme == "http" else 443
+    port = normalize_public_port(requested_port if requested_port not in {None, ""} else parsed_port or default_port)
+    if parsed_port is not None and port != parsed_port:
+        raise ValueError("public port must match the endpoint URL")
+    return host, port, public_url(host, port, scheme), scheme
 
 
 def discover_profile_ids(hermes_home: Path) -> list[str]:
@@ -125,9 +164,14 @@ def inspect_server_info(payload: Any) -> tuple[str, int, str, bool]:
 
 
 def _endpoint_command(args: argparse.Namespace) -> int:
-    host = normalize_public_host(args.host)
-    port = normalize_public_port(args.port)
-    print(f"{host}\t{port}\t{public_url(host, port)}")
+    if args.url:
+        host, port, endpoint, scheme = normalize_public_endpoint(args.url, args.port)
+    else:
+        host = normalize_public_host(args.host)
+        port = normalize_public_port(args.port)
+        scheme = normalize_public_scheme(args.scheme)
+        endpoint = public_url(host, port, scheme)
+    print(f"{host}\t{port}\t{endpoint}\t{scheme}")
     return 0
 
 
@@ -151,9 +195,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Hermes Link deployment metadata helper")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    endpoint = subparsers.add_parser("endpoint", help="validate a public HTTPS endpoint")
-    endpoint.add_argument("--host", required=True)
-    endpoint.add_argument("--port", required=True)
+    endpoint = subparsers.add_parser("endpoint", help="validate an App-facing HTTP or HTTPS endpoint")
+    endpoint_group = endpoint.add_mutually_exclusive_group(required=True)
+    endpoint_group.add_argument("--host")
+    endpoint_group.add_argument("--url")
+    endpoint.add_argument("--port", default="")
+    endpoint.add_argument("--scheme", default="http")
     endpoint.set_defaults(handler=_endpoint_command)
 
     profiles = subparsers.add_parser("profiles", help="list visible Hermes Profile IDs")

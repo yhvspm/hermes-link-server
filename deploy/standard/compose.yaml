@@ -2,19 +2,30 @@ services:
   server:
     image: ${HERMES_LINK_IMAGE:?Set HERMES_LINK_IMAGE in the generated .env file.}
     network_mode: host
+    depends_on:
+      model-config-exporter:
+        condition: service_started
     env_file:
-      - ${HERMES_LINK_INTERNAL_ENV_FILE:?Set HERMES_LINK_INTERNAL_ENV_FILE to the root-only Agent credential file.}
+      - ${HERMES_LINK_INTERNAL_ENV_FILE:?Set HERMES_LINK_INTERNAL_ENV_FILE to the private Agent credential file.}
+      - ${HERMES_LINK_MOBILE_ENV_FILE:?Set HERMES_LINK_MOBILE_ENV_FILE through install.sh.}
     environment:
       HERMES_HOME: /var/lib/hermes-agent
       HERMES_LINK_AGENT_HOME: /var/lib/hermes-agent
-      HERMES_LINK_BRIDGE_PORT: ${HERMES_LINK_BRIDGE_PORT:?Set HERMES_LINK_BRIDGE_PORT through install.sh.}
+      HERMES_LINK_BIND_HOST: ${HERMES_LINK_LISTEN_HOST:?Set HERMES_LINK_LISTEN_HOST through install.sh.}
+      HERMES_LINK_BRIDGE_PORT: ${HERMES_LINK_LISTEN_PORT:?Set HERMES_LINK_LISTEN_PORT through install.sh.}
       HERMES_LINK_PROFILE_IDS: ${HERMES_LINK_PROFILE_IDS:?Set HERMES_LINK_PROFILE_IDS through install.sh or hermes-link sync.}
       HERMES_LINK_PAIRING_DB: /var/lib/hermes-link-server/pairing.db
+      HERMES_LINK_DIRECT_EVENT_DB: /var/lib/hermes-link-server/direct-events.db
       HERMES_LINK_SERVER_IDENTITY_FILE: /var/lib/hermes-link-server/server-identity.json
       HERMES_LINK_CLOUD_CONFIG_FILE: /var/lib/hermes-link-server/cloud-config.json
+      # Optional same-host Cloud route used only for outbound event delivery.
+      # Keep the public Cloud URL in the pairing configuration for mobile clients.
+      HERMES_LINK_CLOUD_OUTBOUND_URL: ${HERMES_LINK_CLOUD_OUTBOUND_URL:-}
       HERMES_LINK_REDACTED_LOG_DIR: /var/lib/hermes-link-server/redacted-logs
+      HERMES_LINK_MODEL_CONFIG_DIR: /var/lib/hermes-link-server/model-config
     volumes:
       - ./data/server:/var/lib/hermes-link-server
+      - ./data/server/model-config:/var/lib/hermes-link-server/model-config:ro
       - ${HERMES_LINK_AGENT_HOME_HOST:?Set HERMES_LINK_AGENT_HOME_HOST to the local Hermes metadata directory.}:/var/lib/hermes-agent:ro
     user: "10001:10001"
     read_only: true
@@ -26,6 +37,25 @@ services:
       timeout: 5s
       retries: 4
       start_period: 10s
+    restart: unless-stopped
+
+  model-config-exporter:
+    image: ${HERMES_LINK_IMAGE:?Set HERMES_LINK_IMAGE in the generated .env file.}
+    network_mode: none
+    user: "0:0"
+    environment:
+      HERMES_HOME: /var/lib/hermes-agent
+      HERMES_LINK_PROFILE_IDS: ${HERMES_LINK_PROFILE_IDS:?Set HERMES_LINK_PROFILE_IDS through install.sh or hermes-link sync.}
+      HERMES_LINK_MODEL_CONFIG_DIR: /var/lib/hermes-link-server/model-config
+      HERMES_LINK_MODEL_CONFIG_UID: "0"
+      HERMES_LINK_MODEL_CONFIG_GID: "10001"
+    volumes:
+      - ./data/server/model-config:/var/lib/hermes-link-server/model-config
+      - ${HERMES_LINK_AGENT_HOME_HOST:?Set HERMES_LINK_AGENT_HOME_HOST to the local Hermes metadata directory.}:/var/lib/hermes-agent:ro
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    command: ["python", "-m", "hermes_link.integrations.hermes_agent.model_config_exporter"]
     restart: unless-stopped
 
   log-exporter:
@@ -42,24 +72,4 @@ services:
     tmpfs:
       - /tmp:mode=1777,size=16m
     command: ["python", "-m", "hermes_link.observability.redacted_logs"]
-    restart: unless-stopped
-
-  caddy:
-    image: caddy:2.8-alpine
-    network_mode: host
-    depends_on:
-      server:
-        condition: service_healthy
-    profiles: ["caddy"]
-    environment:
-      HERMES_LINK_PUBLIC_HOST: ${HERMES_LINK_PUBLIC_HOST:?Set HERMES_LINK_PUBLIC_HOST in the generated .env file.}
-      HERMES_LINK_PUBLIC_PORT: ${HERMES_LINK_PUBLIC_PORT:?Set HERMES_LINK_PUBLIC_PORT in the generated .env file.}
-      HERMES_LINK_BRIDGE_PORT: ${HERMES_LINK_BRIDGE_PORT:?Set HERMES_LINK_BRIDGE_PORT through install.sh.}
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./data/caddy-data:/data
-      - ./data/caddy-config:/config
-    read_only: true
-    tmpfs:
-      - /tmp:mode=1777,size=64m
     restart: unless-stopped

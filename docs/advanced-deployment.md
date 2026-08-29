@@ -1,97 +1,67 @@
 # Advanced deployment
 
-The supported default is [`install.sh`](../install.sh), which owns the Caddy
-configuration, public port, certificate lifecycle, and `/opt/hermes-link/`
-runtime. This page is for hosts that already have a reverse proxy or a
-certificate-management policy.
+The supported default is [`install.sh`](../install.sh). It runs Hermes Link
+Server directly over HTTP. It does not install or manage Caddy, Nginx, a TLS
+certificate, DNS validation, or TCP `80`.
 
-## Existing reverse proxy
+## Direct HTTP with an IP address
 
-Choose **existing reverse proxy** during installation. Hermes Link starts only
-the Server and redacted-log exporter. It selects the first unused loopback port
-in its private range and records it only in the root-only generated `.env`.
-After installation, use the target reported by `sudo hermes-link doctor`; do
-not expose that loopback port directly.
+This is the lowest-friction mode for a trusted LAN, VPN, or other controlled
+network. Choose an App-reachable IP address and an unprivileged TCP port:
 
-```text
-http://127.0.0.1:<reported-in-hermes-link-doctor>
+```bash
+sudo bash ./install.sh \
+  --host 192.168.1.10 \
+  --public-port 18766
 ```
 
-The generated `.env` still records the App-facing HTTPS URL and public port,
-so `hermes-link status`, `doctor`, and future pairing flows report the correct
-origin. Do not expose the loopback port directly.
+The App URL is `http://192.168.1.10:18766`. The Server binds directly to
+`0.0.0.0:18766`; allow that port in the host firewall if the phone is on a
+different device or network namespace. There is no TCP `80` prerequisite.
 
-Your proxy must route only `/hermes-link/v1/*`, preserve `Authorization` and
-standard forwarding headers, support long-lived streaming responses, and avoid
-response buffering. For example, an existing Caddy site can contain:
+HTTP carries API and pairing device tokens without transport encryption. Use
+this mode only when the network is trusted. Do not expose it broadly to the
+Internet.
 
-```caddyfile
-@hermes_link path /hermes-link/v1/*
-reverse_proxy @hermes_link 127.0.0.1:<reported-in-hermes-link-doctor> {
-    flush_interval -1
-}
+## User-managed HTTPS proxy
+
+For a public HTTPS endpoint, obtain the domain certificate and configure the
+proxy yourself. Hermes Link Server remains an HTTP upstream and does not read
+certificate files.
+
+```bash
+sudo bash ./install.sh \
+  --public-url https://hermes.example.com:24443 \
+  --listen-host 127.0.0.1 \
+  --listen-port 18766
 ```
 
-An Nginx location needs equivalent SSE handling:
+Configure the chosen proxy to forward only `/hermes-link/v1/*` to
+`http://127.0.0.1:18766`, preserve `Authorization`, and disable response
+buffering for long-lived chat and notification streams. For example:
 
 ```nginx
 location /hermes-link/v1/ {
-    proxy_pass http://127.0.0.1:<reported-in-hermes-link-doctor>;
+    proxy_pass http://127.0.0.1:18766;
     proxy_http_version 1.1;
     proxy_buffering off;
     proxy_read_timeout 3600s;
 }
 ```
 
-The existing proxy, not Hermes Link, owns certificate issuance, public-port
-conflicts, DNS challenge configuration, and firewall rules in this mode.
+The proxy owns the certificate lifecycle, DNS configuration, public port,
+firewall rule, and any TLS security headers. The Server's pairing QR will use
+the `--public-url` origin.
 
-## Automatic Caddy certificate requirements
+## State and migration
 
-The standard Caddy mode accepts a custom public HTTPS port. Its certificate is
-still validated separately: the first version uses Caddy's HTTP-01 flow, which
-requires public TCP 80 to reach the host. If TCP 80 is unavailable because of
-another proxy, network policy, or certificate-management policy, use external
-proxy mode with an existing certificate or DNS challenge setup.
+`data/server/` holds Server identity, device pairing records, optional Cloud
+binding, direct-notification state, and redacted diagnostics. Do not run
+`docker compose down -v` inside `/opt/hermes-link/`.
 
-`hermes-link doctor` reports the Caddy container, Caddyfile validation, local
-listener, and the configured public URL separately. A running container alone
-does not prove that DNS, TLS, or the public firewall is correct.
-
-## State and recovery
-
-Do not run `docker compose down -v` in `/opt/hermes-link/`. The Server identity,
-pairing records, Cloud binding, and redacted diagnostics live below
-`data/server/`; Caddy's certificate state lives below `data/caddy-*`.
-
-`sudo hermes-link update` creates a timestamped snapshot in `backups/`, keeps
-the old image, and restores the prior state if its post-update checks fail.
-`sudo hermes-link uninstall` stops the runtime but preserves data by default.
-Only `sudo hermes-link uninstall --purge`, followed by typing `DELETE`, removes
-the persisted identity and bindings.
-
-## Migrating an existing runtime
-
-The normal installer is intentionally a fresh-install path. For a reviewed
-local migration, stop the old Server container first so SQLite state is
-consistent, back up its Server state, then use the advanced
-`--reuse-agent-credential` and `--state-import-dir` flags. The credential must
-already be a regular root-owned `0600` file; in this mode the installer does
-not create, rotate, restart, or otherwise alter the Agent service.
-
-Only the stable Server identity, pairing database and its SQLite sidecars, and
-an optional Cloud binding file are imported. Logs, arbitrary files, and Agent
-credentials are never copied into the standard runtime. Build or preload a
-reviewed local image and add `--skip-image-pull` when the cutover must avoid an
-image download. A reviewed local source tree without `release-manifest.json`
-is intentionally treated as an advanced migration path: it cannot provide the
-published SHA-256 asset and image-digest verification. Normal published
-installs and updates always require that manifest.
-
-## Compatibility deployment assets
-
-The repository retains the prior native/systemd and source-build Docker assets
-for reviewed migrations and isolated validation. They use their own documented
-settings and are not a substitute for the standard runtime. Do not copy a
-historical deployment's domain, public port, host path, or credential file into
-the generated standard `.env`.
+`sudo hermes-link update` creates a timestamped snapshot and rolls back if
+local health, identity, Profile exposure, or Cloud capability verification
+fails. A prior installer-managed Caddy runtime is deliberately not upgraded
+in place: configure the desired direct HTTP or external-proxy transport first,
+then perform a reviewed migration so an existing public endpoint is not
+silently broken.

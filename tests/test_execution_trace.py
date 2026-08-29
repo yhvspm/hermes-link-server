@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from unittest.mock import patch
 
@@ -85,6 +86,35 @@ class CloudChatCompletionTests(unittest.TestCase):
         self.assertTrue(event["run_id"].startswith("run_"))
         self.assertEqual(event["dedupe_key"], f"chat:session_1:{event['run_id']}")
         self.assertFalse({"prompt", "messages", "response", "body"}.intersection(event))
+
+    def test_cloud_event_uses_outbound_override_without_changing_mobile_cloud_url(self) -> None:
+        with patch(
+            "hermes_link.integrations.hermes_agent.bridge.load_cloud_config",
+            return_value={
+                "cloud_url": "https://cloud.example.test/public",
+                "installation_id": "installation_1",
+                "server_id": "server_" + "a" * 32,
+            },
+        ), patch(
+            "hermes_link.integrations.hermes_agent.bridge.get_or_create_identity",
+            return_value={
+                "server_id": "server_" + "a" * 32,
+                "private_key_pem": "test-private-key",
+            },
+        ), patch(
+            "hermes_link.integrations.hermes_agent.bridge.CloudEventSender"
+        ) as sender_type, patch.dict(
+            os.environ,
+            {"HERMES_LINK_CLOUD_OUTBOUND_URL": "https://cloud.example.test/internal"},
+            clear=False,
+        ):
+            _publish_cloud_chat_completed("mobiletest", "session_1")
+
+        sender_type.assert_called_once_with(
+            "https://cloud.example.test/internal",
+            "server_" + "a" * 32,
+            "test-private-key",
+        )
 
 
 class ChatStreamRelayTests(unittest.TestCase):

@@ -2,7 +2,7 @@
 
 > Self-hosted is the baseline. Cloud is optional. Hermes Link Server is the compatibility boundary between clients and Hermes Agent.
 
-Repository visibility: **Public**. Server version: **1.0.1**.
+Repository visibility: **Public**. Server version: **1.0.2**.
 
 ```text
 Hermes Link App
@@ -28,6 +28,11 @@ Hermes Agent
 ```
 
 Cloud is absent. Chat, Sessions, Models, Jobs, Cron, history synchronization and DIRECT notifications remain functional.
+
+The standard deployment binds the Server directly to a selected HTTP port and
+allows an App-facing IP address or DNS name. TLS termination, certificates, and
+reverse proxies are external optional infrastructure; they are not managed by
+Hermes Link Server.
 
 ## Cloud mode
 

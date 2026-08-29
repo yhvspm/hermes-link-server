@@ -11,24 +11,28 @@ state locally, and treats Cloud notifications as optional.
 On a supported Ubuntu host that already runs Hermes Agent and Docker Compose:
 
 ```bash
-curl -fL https://github.com/yhvspm/hermes-link-server/releases/download/v1.0.1/hermes-link-server-install.sh -o hermes-link-server-install.sh
+curl -fL https://github.com/yhvspm/hermes-link-server/releases/download/v1.0.2/hermes-link-server-install.sh -o hermes-link-server-install.sh
 sudo bash hermes-link-server-install.sh
 ```
 
 The installer asks for:
 
-- A public DNS name
-- A public HTTPS port (default: `443`)
-- Automatic Caddy HTTPS, or an existing reverse proxy
+- An App-facing IP address or DNS name
+- A public HTTP port (default: `18766`)
+
+For a direct-IP deployment, the App URL is for example
+`http://203.0.113.42:18766`. Hermes Link Server binds that selected unprivileged
+port directly; it does not install Caddy, issue a certificate, or require TCP
+`80`.
 
 To migrate an existing managed `v1.0.0` installation without changing its
 identity or pairing state, run the same downloaded installer with
-`--upgrade-existing`. It first stages the verified `v1.0.1` update command,
+`--upgrade-existing`. It first stages the verified `v1.0.2` update command,
 then uses the normal backup-and-rollback update flow.
 
-When the selected port is `443`, the App URL is `https://hermes.example.com`.
-For another port it is `https://hermes.example.com:18443`. The private internal
-Bridge port is managed by Hermes Link and is not an App or firewall setting.
+The selected port must be in `1024..65535` because the Server remains an
+unprivileged container process. It is the App-facing listener; there is no
+separate Caddy or hidden public port.
 
 The current standard installer supports Ubuntu 22.04 and newer, including
 25.10 and 26.04. It checks for Docker Engine with Compose v2 rather than
@@ -45,9 +49,8 @@ sudo hermes-link logs server
 ```
 
 `update` backs up configuration and persisted Server state, verifies local
-health, identity stability, Profile preservation, Cloud V3 capability, and
-the public HTTPS URL. If a managed-Caddy update fails, it restores the
-previous image, configuration, and state automatically.
+health, identity stability, Profile preservation, and Cloud V3 capability
+before completing or rolling back.
 
 ## Release integrity
 
@@ -76,7 +79,6 @@ The installer creates `/opt/hermes-link/`:
 compose.yaml     Standard prebuilt-image runtime
 .env             Generated deployment metadata, mode 0600
 data/server/     Pairing, Server identity, Cloud binding, and redacted logs
-data/caddy-*/    Caddy certificate and configuration state
 backups/         Update snapshots
 bin/             hermes-link CLI and local installer helpers
 ```
@@ -86,17 +88,23 @@ identity is explicitly mounted there, so replacing a container does not create
 a new `serverId`. Hermes Profile discovery reads only valid Profile directory
 names and enables them through the generated allowlist.
 
-## HTTPS and custom ports
+## HTTP, IP addresses, and optional external HTTPS
 
-The recommended mode is Caddy. It proxies streaming responses without buffering
-and obtains/renews certificates automatically. Caddy's HTTP-01 certificate
-flow still needs inbound TCP 80 even when the App uses a custom HTTPS port.
+The standard runtime exposes Hermes Link Server directly over HTTP and accepts
+an IP address or DNS name for the App URL. It does not depend on a domain,
+certificate, TCP `80`, Caddy, Nginx, or a reverse proxy. The installer renders
+a short-lived pairing QR after a healthy startup; the App can also save an
+explicit `http://IP:PORT` address.
 
-If another proxy already owns the public port or certificate, choose external
-proxy mode. Hermes Link selects an unused loopback Bridge port and records it
-in the root-only generated `.env`; `sudo hermes-link doctor` reports the exact
-proxy target. Configure the existing proxy for `/hermes-link/v1/*` with
-SSE/streaming support. See [advanced deployment](docs/advanced-deployment.md).
+HTTP is intentionally marked as unencrypted in both the installer and App.
+API and pairing device tokens travel on that connection, so use direct HTTP
+only on a trusted LAN/VPN or another network you control.
+
+If you want an Internet-facing HTTPS URL, obtain and renew the certificate and
+configure Nginx, Caddy, or another proxy yourself. Pass its external App URL
+with `--public-url https://…` and use `--listen-host 127.0.0.1 --listen-port`
+for its local HTTP upstream. Hermes Link Server does not read certificate files
+or manage that proxy. See [advanced deployment](docs/advanced-deployment.md).
 
 ## Security and repository boundaries
 

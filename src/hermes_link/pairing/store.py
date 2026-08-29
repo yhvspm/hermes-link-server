@@ -1,8 +1,8 @@
-"""One-time HTTPS pairing tickets for Hermes Link mobile setup.
+"""One-time HTTP(S) pairing tickets for Hermes Link mobile setup.
 
 The QR payload contains only a short-lived random code.  The corresponding
 API token remains in this root-only SQLite database and is returned once over
-the HTTPS exchange endpoint.  This module never logs or prints the token.
+the configured exchange endpoint. This module never logs or prints the token.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from urllib.parse import quote
 PAIRING_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 DEVICE_ID_PATTERN = re.compile(r"^dev_[A-Za-z0-9]{32}$")
 DEVICE_TOKEN_PATTERN = re.compile(r"^hmd_[A-Za-z0-9_-]{32,128}$")
-BASE_URL_PATTERN = re.compile(r"^https://[^/?#]+(?:/[^?#]*)?$")
+BASE_URL_PATTERN = re.compile(r"^https?://[^/?#]+$")
 DEFAULT_TTL_SECONDS = 600
 
 
@@ -52,7 +52,7 @@ def _db_path() -> Path:
 def _validate_base_url(base_url: str) -> str:
     normalized = str(base_url).strip().rstrip("/")
     if not BASE_URL_PATTERN.fullmatch(normalized) or "@" in normalized:
-        raise PairingError("Pairing base URL must use HTTPS", code="pairing_url_invalid")
+        raise PairingError("Pairing base URL must use HTTP or HTTPS", code="pairing_url_invalid")
     return normalized
 
 
@@ -345,7 +345,7 @@ def revoke_device_token(token: str, *, path: Path | str | None = None) -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create a Hermes Link one-time pairing URL")
-    parser.add_argument("--base-url", required=True, help="Public HTTPS Hermes API URL")
+    parser.add_argument("--base-url", required=True, help="App-facing HTTP or HTTPS Hermes API URL")
     parser.add_argument("--ttl", type=int, default=DEFAULT_TTL_SECONDS)
     parser.add_argument("--db", default=None)
     parser.add_argument("--profiles", default="", help="Comma-separated Profile scope for the device token")

@@ -8,10 +8,10 @@ Usage: verify-isolated-compose.sh --server-env /secure/server.env --hermes-home 
 
 Starts only a temporary Server container on an isolated loopback port, verifies
 health, Server-info, and one-time pairing exchange, then removes its dedicated
-Compose project and volumes. It never starts the Caddy proxy or prints tokens.
+Compose project and volumes. It never exposes a public listener or prints tokens.
 
 Options:
-  --bridge-port PORT  Isolated Bridge port (default: 18765)
+  --bridge-port PORT  Isolated Bridge port (default: 18766)
   --project-name NAME Compose project name (default: hermes-link-isolated-verify)
   --server-env PATH   Restricted Server environment file (required)
   --hermes-home PATH  Host Hermes metadata directory mounted read-only (required)
@@ -20,7 +20,7 @@ EOF
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd -- "$script_dir/.." && pwd)"
-bridge_port='18765'
+bridge_port='18766'
 project_name='hermes-link-isolated-verify'
 server_env=''
 hermes_home=''
@@ -78,7 +78,7 @@ curl --fail --silent "http://127.0.0.1:${bridge_port}/health" >/dev/null
 curl --fail --silent "http://127.0.0.1:${bridge_port}/hermes-link/v1/server-info" |
   python3 -c "import json,sys; value=json.load(sys.stdin); assert value['protocolVersion'] == 1; print('server-info: protocol-v1')"
 
-pairing_code=$("${compose[@]}" exec -T server python -c "from hermes_link.pairing.store import create_pairing_ticket; import os; token=(os.environ.get('HERMES_LINK_MOBILE_API_TOKEN') or os.environ.get('HERMES_LINK_AGENT_TOKEN') or '').strip(); assert token, 'Missing Server-to-Agent credential'; url=create_pairing_ticket('https://compose-validation.example.invalid:18443', token, path=os.environ['HERMES_LINK_PAIRING_DB'])['pairing_url']; print(url.split('code=', 1)[1].split('&', 1)[0])")
+pairing_code=$("${compose[@]}" exec -T server python -c "from hermes_link.pairing.store import create_pairing_ticket; import os; token=(os.environ.get('HERMES_LINK_MOBILE_API_TOKEN') or os.environ.get('HERMES_LINK_AGENT_TOKEN') or '').strip(); assert token, 'Missing Server-to-Agent credential'; url=create_pairing_ticket('http://compose-validation.example.invalid:18766', token, path=os.environ['HERMES_LINK_PAIRING_DB'])['pairing_url']; print(url.split('code=', 1)[1].split('&', 1)[0])")
 pairing_response=$(curl --fail --silent -X POST "http://127.0.0.1:${bridge_port}/hermes-link/v1/pairing" \
   -H 'Content-Type: application/json' \
   --data "{\"schema_version\":1,\"code\":\"${pairing_code}\"}")

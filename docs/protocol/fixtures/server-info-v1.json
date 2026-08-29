@@ -15,6 +15,7 @@
     "executionTrace": true,
     "directNotifications": true,
     "cloudNotifications": true,
-    "cloudMultiBinding": false
+    "cloudMultiBinding": false,
+    "chatAttachments": true
   }
 }

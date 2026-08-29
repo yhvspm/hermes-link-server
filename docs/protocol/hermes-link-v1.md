@@ -26,7 +26,8 @@ The App communicates with Hermes Link Server, never Hermes Agent internals. All 
     "pairing": true,
     "directNotifications": true,
     "cloudNotifications": true,
-    "cloudMultiBinding": true
+    "cloudMultiBinding": true,
+    "chatAttachments": true
   }
 }
 ```
@@ -65,6 +66,23 @@ The Hermes Agent adapter may translate these operations to version-specific inte
 Server must preserve that identity while translating the request inside the
 Hermes Agent adapter. It must not silently create a second Session or require
 the App to know the Agent's internal session API.
+
+## Chat attachments
+
+When `features.chatAttachments` is true, user chat messages may include an
+`attachments` array. The Server accepts at most four attachments and a combined
+four MiB decoded payload. Each item contains `kind`, `name`, `media_type`, and
+base64 `data_base64`; no device URI, local path, or server file reference is
+accepted.
+
+- `kind: "image"` accepts JPEG, PNG, GIF, and WebP. The Server converts it to
+  an OpenAI-compatible `image_url` data URI before forwarding to Hermes Agent.
+- `kind: "text"` accepts UTF-8 plain text, Markdown, JSON, CSV, XML, and YAML
+  files up to 512 KiB each. It is labelled and included as message text.
+
+PDF, Office documents, archives, executables, and all other binary uploads are
+rejected. Hermes Agent's public chat API has no general file-upload contract;
+the Server does not persist attachment data or expose it as a local path.
 
 ## Chat execution trace
 

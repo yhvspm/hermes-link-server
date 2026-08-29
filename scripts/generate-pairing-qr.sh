@@ -4,7 +4,7 @@ umask 077
 
 usage() {
   cat <<'EOF'
-Usage: generate-pairing-qr.sh --base-url https://link.example.com[:port] --env-file /etc/hermes-link-server/server.env [options]
+Usage: generate-pairing-qr.sh --base-url http://IP-or-host:PORT --env-file /etc/hermes-link-server/server.env [options]
 
 Options:
   --profiles LIST    Comma-separated Profile IDs (default: default)

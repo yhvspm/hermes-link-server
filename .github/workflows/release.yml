@@ -97,7 +97,6 @@ jobs:
           for asset in \
             install.sh \
             deploy/standard/compose.yaml \
-            deploy/standard/Caddyfile \
             deploy/standard/.env.example \
             deploy/standard/bin/hermes-link \
             scripts/deployment_helpers.py \
@@ -130,7 +129,6 @@ jobs:
           for asset in \
             install.sh \
             deploy/standard/compose.yaml \
-            deploy/standard/Caddyfile \
             deploy/standard/.env.example \
             deploy/standard/bin/hermes-link \
             scripts/deployment_helpers.py \
@@ -176,7 +174,6 @@ jobs:
           for asset in \
             install.sh \
             deploy/standard/compose.yaml \
-            deploy/standard/Caddyfile \
             deploy/standard/.env.example \
             deploy/standard/bin/hermes-link \
             scripts/deployment_helpers.py \

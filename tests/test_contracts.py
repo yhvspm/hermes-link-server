@@ -86,6 +86,7 @@ class PublicContractTests(unittest.TestCase):
                 "directNotifications",
                 "cloudNotifications",
                 "cloudMultiBinding",
+                "chatAttachments",
             },
         )
         self.assertTrue(all(isinstance(value, bool) for value in features.values()))

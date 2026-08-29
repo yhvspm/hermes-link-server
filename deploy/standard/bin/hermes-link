@@ -2,14 +2,15 @@
 set -euo pipefail
 umask 077
 
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+script_path="$(readlink -f -- "${BASH_SOURCE[0]}")"
+script_dir="$(cd -- "$(dirname -- "$script_path")" && pwd)"
 root_dir="$(cd -- "$script_dir/.." && pwd)"
 env_file="$root_dir/.env"
 helper="$root_dir/bin/lib/deployment_helpers.py"
 release_manifest_helper="$root_dir/bin/lib/release_manifest.py"
 release_image_repository='ghcr.io/yhvspm/hermes-link-server'
 default_release_download_base_url='https://github.com/yhvspm/hermes-link-server/releases/download'
-bridge_port='18765'
+bridge_port='18766'
 image_loaded_from_archive=false
 
 usage() {
@@ -18,12 +19,13 @@ Usage: hermes-link <command> [options]
 
 Commands:
   status                 Show non-sensitive deployment status
-  doctor                 Diagnose Docker, Hermes, identity, Profiles and HTTPS
+  doctor                 Diagnose Docker, Hermes, identity, Profiles and the local listener
   update [--version V]   Safely update a pinned release and roll back on failure
   restart                Restart the managed runtime without deleting state
-  logs [server|log-exporter|caddy]
+  logs [server|log-exporter|model-config-exporter]
                          Show the latest managed container logs
   sync                   Re-discover Hermes Profile directory names
+  pair [--ttl SECONDS]   Render a short-lived App pairing QR code
   uninstall [--purge]    Stop the runtime; --purge requires a second confirmation
 
 Run mutating commands with sudo. The CLI never prints Agent tokens, private
@@ -53,11 +55,9 @@ env_get() {
 
 configured_bridge_port() {
   local configured=''
-  configured="$(env_get HERMES_LINK_BRIDGE_PORT 2>/dev/null || true)"
-  if [[ -z "$configured" ]]; then
-    printf '%s' '18765'
-    return
-  fi
+  configured="$(env_get HERMES_LINK_LISTEN_PORT 2>/dev/null || true)"
+  if [[ -z "$configured" ]]; then configured="$(env_get HERMES_LINK_BRIDGE_PORT 2>/dev/null || true)"; fi
+  if [[ -z "$configured" ]]; then configured='18766'; fi
   [[ "$configured" =~ ^[0-9]+$ ]] && (( configured >= 1024 && configured <= 65535 )) || \
     fail 'HERMES_LINK_BRIDGE_PORT must be a valid unprivileged TCP port'
   printf '%s' "$configured"
@@ -92,13 +92,8 @@ temporary.replace(path)
 PY
 }
 
-proxy_mode() {
-  env_get HERMES_LINK_PROXY_MODE
-}
-
 compose() {
   local command=(docker compose --env-file "$env_file" --project-directory "$root_dir")
-  if [[ "$(proxy_mode)" == 'caddy' ]]; then command+=(--profile caddy); fi
   command+=(-f "$root_dir/compose.yaml")
   "${command[@]}" "$@"
 }
@@ -134,12 +129,30 @@ public_port() {
   env_get HERMES_LINK_PUBLIC_PORT
 }
 
-public_https_reachable() {
+listen_host() {
+  local configured=''
+  configured="$(env_get HERMES_LINK_LISTEN_HOST 2>/dev/null || true)"
+  if [[ -z "$configured" ]]; then configured='0.0.0.0'; fi
+  [[ "$configured" == '127.0.0.1' || "$configured" == '0.0.0.0' ]] || \
+    fail 'HERMES_LINK_LISTEN_HOST must be 127.0.0.1 or 0.0.0.0'
+  printf '%s' "$configured"
+}
+
+listen_port() {
+  local configured=''
+  configured="$(env_get HERMES_LINK_LISTEN_PORT 2>/dev/null || true)"
+  if [[ -z "$configured" ]]; then configured="$(public_port)"; fi
+  [[ "$configured" =~ ^[0-9]+$ ]] && (( 10#$configured >= 1024 && 10#$configured <= 65535 )) || \
+    fail 'HERMES_LINK_LISTEN_PORT must be an unprivileged TCP port in 1024..65535'
+  printf '%s' "$configured"
+}
+
+public_endpoint_reachable() {
   curl --fail --silent --max-time 10 "$(public_url)/hermes-link/v1/server-info" >/dev/null
 }
 
-public_port_listening() {
-  python3 - "$(public_port)" <<'PY'
+local_listener_reachable() {
+  python3 - "$(listen_port)" <<'PY'
 import socket
 import sys
 
@@ -187,13 +200,14 @@ status_command() {
   else
     print_row 'Server ID' '! Needs verification'
   fi
-  if [[ "$(proxy_mode)" == 'caddy' ]]; then
-    if public_https_reachable; then print_row 'HTTPS' '✓'; else print_row 'HTTPS' '! Not verified'; fi
+  if [[ "$(public_url)" == http://* ]]; then
+    print_row 'Transport' '! HTTP (unencrypted)'
   else
-    print_row 'HTTPS' '! External reverse proxy mode'
+    print_row 'Transport' 'External HTTPS'
   fi
-  print_row 'Public URL' "$(public_url)"
+  print_row 'App URL' "$(public_url)"
   print_row 'Public Port' "$(public_port)"
+  print_row 'Listener' "$(listen_host):$(listen_port)"
   if [[ "$cloud_multi_binding" == 'true' ]]; then print_row 'Cloud V3' '✓ Supported'; else print_row 'Cloud V3' '! Not reported'; fi
 }
 
@@ -225,6 +239,11 @@ doctor_command() {
 
   if docker_ready; then doctor_pass 'Docker daemon and Docker Compose'; else doctor_fail 'Docker daemon or Docker Compose is unavailable'; fi
   if docker_ready && service_running server; then doctor_pass 'Server container'; else doctor_fail 'Server container is not running'; fi
+  if docker_ready && service_running model-config-exporter; then
+    doctor_pass 'Model configuration exporter'
+  else
+    doctor_fail 'Model configuration exporter is not running'
+  fi
   if local_health; then doctor_pass 'Server health'; else doctor_fail "Server health on 127.0.0.1:$bridge_port"; fi
   if fields="$(server_info_fields 2>/dev/null)"; then
     IFS=$'\t' read -r gateway_state active_agents api_server_id cloud_multi_binding <<< "$fields"
@@ -274,18 +293,16 @@ doctor_command() {
   fi
 
   if [[ "$cloud_multi_binding" == 'true' ]]; then doctor_pass 'cloudMultiBinding capability'; else doctor_fail 'cloudMultiBinding capability'; fi
-  if [[ "$(proxy_mode)" == 'caddy' ]]; then
-    if service_running caddy; then doctor_pass 'Caddy container'; else doctor_fail 'Caddy container'; fi
-    if compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
-      doctor_pass 'Caddy configuration'
-    else
-      doctor_fail 'Caddy configuration'
-    fi
+  if local_listener_reachable; then
+    doctor_pass "Local HTTP listener $(listen_host):$(listen_port)"
   else
-    doctor_note "External reverse proxy mode; target: http://127.0.0.1:$bridge_port"
+    doctor_fail "Local HTTP listener $(listen_host):$(listen_port)"
   fi
-  if public_port_listening; then doctor_pass "Public port $(public_port) listener"; else doctor_fail "Public port $(public_port) listener"; fi
-  if public_https_reachable; then doctor_pass "HTTPS public URL $(public_url)"; else doctor_fail "HTTPS public URL $(public_url)"; fi
+  if public_endpoint_reachable; then
+    doctor_pass "App URL $(public_url)"
+  else
+    doctor_note "App URL was not verified from this host: $(public_url)"
+  fi
 
   if [[ -f "$root_dir/data/server/cloud-config.json" ]]; then
     cloud_url="$(python3 - "$root_dir/data/server/cloud-config.json" <<'PY'
@@ -340,8 +357,8 @@ restart_command() {
 logs_command() {
   require_installation
   local service="${1:-}"
-  if [[ -n "$service" && "$service" != 'server' && "$service" != 'log-exporter' && "$service" != 'caddy' ]]; then
-    fail 'logs accepts only server, log-exporter, or caddy'
+  if [[ -n "$service" && "$service" != 'server' && "$service" != 'log-exporter' && "$service" != 'model-config-exporter' ]]; then
+    fail 'logs accepts only server, log-exporter, or model-config-exporter'
   fi
   if [[ -n "$service" ]]; then compose logs --tail=200 "$service"; else compose logs --tail=200; fi
 }
@@ -353,9 +370,30 @@ sync_command() {
   profiles="$(python3 "$helper" profiles --hermes-home "$(env_get HERMES_LINK_AGENT_HOME_HOST)" | paste -sd, -)" || fail 'Unable to discover Hermes Profiles'
   [[ -n "$profiles" ]] || fail 'No Hermes Profiles were discovered'
   env_set HERMES_LINK_PROFILE_IDS "$profiles"
-  compose up -d --force-recreate server log-exporter
+  compose up -d --force-recreate model-config-exporter server log-exporter
   wait_for_local_health || fail 'Server did not become healthy after Profile synchronization'
   printf 'Exposed Hermes Profiles: %s\n' "$profiles"
+}
+
+pair_command() {
+  require_installation
+  require_root
+  local ttl='600'
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ttl) ttl="${2:-}"; shift 2 ;;
+      -h|--help) printf 'Usage: hermes-link pair [--ttl SECONDS]\n'; return 0 ;;
+      *) fail "Unknown pair option: $1" ;;
+    esac
+  done
+  [[ "$ttl" =~ ^[0-9]+$ ]] && (( 10#$ttl >= 30 && 10#$ttl <= 3600 )) || \
+    fail '--ttl must be in 30..3600 seconds'
+  compose exec -T server python -m hermes_link.pairing.store \
+    --base-url "$(public_url)" \
+    --profiles "$(configured_profiles)" \
+    --ttl "$ttl" \
+    --token-env HERMES_LINK_MOBILE_API_TOKEN \
+    --qr
 }
 
 release_version() {
@@ -459,7 +497,7 @@ pull_or_import_image() {
 backup_current_installation() {
   local backup_dir="$1"
   install -d -m 0700 "$backup_dir/config"
-  cp -a "$env_file" "$root_dir/compose.yaml" "$root_dir/Caddyfile" "$root_dir/.env.example" "$backup_dir/config/"
+  cp -a "$env_file" "$root_dir/compose.yaml" "$root_dir/.env.example" "$backup_dir/config/"
   if [[ -f "$root_dir/release-manifest.json" ]]; then
     cp -a "$root_dir/release-manifest.json" "$backup_dir/config/"
   else
@@ -504,12 +542,14 @@ verify_updated_runtime() {
   [[ "$(identity_server_id)" == "$expected_server_id" ]] || return 1
   [[ "$(configured_profiles)" == "$expected_profiles" ]] || return 1
   [[ "$cloud_multi_binding" == 'true' ]] || return 1
-  if [[ "$(proxy_mode)" == 'caddy' ]]; then public_https_reachable || return 1; fi
 }
 
 update_command() {
   require_installation
   require_root
+  if [[ "$(env_get HERMES_LINK_PROXY_MODE 2>/dev/null || true)" == 'caddy' ]]; then
+    fail 'This installation is Caddy-managed. Configure an external proxy or migrate to direct HTTP before updating to this release.'
+  fi
   local requested_version=''
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -536,7 +576,6 @@ update_command() {
   if ! {
     download_release_manifest "$requested_version" "$update_dir/release-manifest.json"
     download_release_asset "$requested_version" "$update_dir/release-manifest.json" 'deploy/standard/compose.yaml' "$update_dir/compose.yaml"
-    download_release_asset "$requested_version" "$update_dir/release-manifest.json" 'deploy/standard/Caddyfile' "$update_dir/Caddyfile"
     download_release_asset "$requested_version" "$update_dir/release-manifest.json" 'deploy/standard/.env.example' "$update_dir/.env.example"
     install -d -m 0755 "$update_dir/bin/lib"
     download_release_asset "$requested_version" "$update_dir/release-manifest.json" 'deploy/standard/bin/hermes-link' "$update_dir/bin/hermes-link"
@@ -571,7 +610,13 @@ update_command() {
     rm -rf -- "$update_dir"
     fail 'Could not create a consistent update backup'
   fi
-  cp -a "$update_dir/compose.yaml" "$update_dir/Caddyfile" "$update_dir/.env.example" "$update_dir/release-manifest.json" "$root_dir/"
+  if [[ -z "$(env_get HERMES_LINK_LISTEN_PORT 2>/dev/null || true)" ]]; then
+    env_set HERMES_LINK_LISTEN_PORT "$(configured_bridge_port)"
+  fi
+  if [[ -z "$(env_get HERMES_LINK_LISTEN_HOST 2>/dev/null || true)" ]]; then
+    env_set HERMES_LINK_LISTEN_HOST '0.0.0.0'
+  fi
+  cp -a "$update_dir/compose.yaml" "$update_dir/.env.example" "$update_dir/release-manifest.json" "$root_dir/"
   cp -a "$update_dir/bin/." "$root_dir/bin/"
   env_set HERMES_LINK_VERSION "$requested_version"
   env_set HERMES_LINK_IMAGE "$new_image"
@@ -617,7 +662,7 @@ uninstall_command() {
     if [[ "$(readlink -f /usr/local/bin/hermes-link 2>/dev/null || true)" == "$root_dir/bin/hermes-link" ]]; then
       rm -f -- /usr/local/bin/hermes-link
     fi
-    printf 'Runtime stopped. Server identity, pairing, Cloud binding, certificates, and backups remain in %s.\n' "$root_dir"
+    printf 'Runtime stopped. Server identity, pairing, Cloud binding, and backups remain in %s.\n' "$root_dir"
     if [[ "$(public_port)" != '443' ]]; then
       printf 'No firewall rule is removed for custom public port %s; Hermes Link did not create one automatically.\n' "$(public_port)"
     fi
@@ -626,7 +671,7 @@ uninstall_command() {
   fi
   [[ "$(basename -- "$root_dir")" == 'hermes-link' && "$root_dir" == /opt/* ]] || \
     fail 'For safety, --purge supports only an installation rooted below /opt/hermes-link.'
-  printf 'This permanently removes Server identity, pairing, Cloud binding, certificates, and backups. Type DELETE to continue: ' >/dev/tty
+  printf 'This permanently removes Server identity, pairing, Cloud binding, and backups. Type DELETE to continue: ' >/dev/tty
   local confirmation=''
   IFS= read -r confirmation </dev/tty || true
   [[ "$confirmation" == 'DELETE' ]] || fail 'Purge cancelled'
@@ -656,6 +701,7 @@ case "$command_name" in
   restart) [[ $# -eq 0 ]] || fail 'restart takes no options'; restart_command ;;
   logs) logs_command "$@" ;;
   sync) [[ $# -eq 0 ]] || fail 'sync takes no options'; sync_command ;;
+  pair) pair_command "$@" ;;
   update) update_command "$@" ;;
   uninstall) uninstall_command "$@" ;;
   *) fail "Unknown command: $command_name" ;;

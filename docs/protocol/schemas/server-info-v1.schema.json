@@ -26,7 +26,8 @@
         "executionTrace",
         "directNotifications",
         "cloudNotifications",
-        "cloudMultiBinding"
+        "cloudMultiBinding",
+        "chatAttachments"
       ],
       "properties": {
         "chat": {"type": "boolean"},
@@ -38,7 +39,8 @@
         "executionTrace": {"type": "boolean"},
         "directNotifications": {"type": "boolean"},
         "cloudNotifications": {"type": "boolean"},
-        "cloudMultiBinding": {"type": "boolean"}
+        "cloudMultiBinding": {"type": "boolean"},
+        "chatAttachments": {"type": "boolean"}
       }
     }
   }

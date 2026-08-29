@@ -5,7 +5,7 @@
     {
       "hermesAgent": "0.19.x",
       "status": "migration-only",
-      "implementation": "compat/hermes_agent_v0_19 patches",
+      "implementation": "server adapter migration verification; legacy artifacts are not deployment dependencies",
       "requiredChecks": ["pairing", "sessions", "chat", "notifications"]
     },
     {

@@ -26,30 +26,50 @@ MANIFEST_SPEC.loader.exec_module(release_manifest)
 
 
 class StandardDeploymentAssetTests(unittest.TestCase):
-    def test_standard_compose_preserves_server_state_and_uses_a_private_bridge_port(self) -> None:
+    def test_standard_compose_preserves_server_state_and_uses_a_direct_http_listener(self) -> None:
         compose_path = ROOT / "deploy" / "standard" / "compose.yaml"
         compose = compose_path.read_text(encoding="utf-8")
         parsed = yaml.safe_load(compose)
         self.assertIn("server", parsed["services"])
-        self.assertIn("caddy", parsed["services"])
+        self.assertIn("model-config-exporter", parsed["services"])
+        self.assertNotIn("caddy", parsed["services"])
         self.assertNotIn("build:", compose)
         self.assertIn("network_mode: host", compose)
         self.assertIn(
-            "HERMES_LINK_BRIDGE_PORT: ${HERMES_LINK_BRIDGE_PORT:?Set HERMES_LINK_BRIDGE_PORT through install.sh.}",
+            "HERMES_LINK_BIND_HOST: ${HERMES_LINK_LISTEN_HOST:?Set HERMES_LINK_LISTEN_HOST through install.sh.}",
+            compose,
+        )
+        self.assertIn(
+            "HERMES_LINK_BRIDGE_PORT: ${HERMES_LINK_LISTEN_PORT:?Set HERMES_LINK_LISTEN_PORT through install.sh.}",
             compose,
         )
         self.assertIn("os.environ['HERMES_LINK_BRIDGE_PORT']", compose)
         self.assertIn("HERMES_LINK_SERVER_IDENTITY_FILE", compose)
         self.assertIn("HERMES_LINK_CLOUD_CONFIG_FILE", compose)
+        self.assertIn("HERMES_LINK_DIRECT_EVENT_DB", compose)
         self.assertIn("./data/server:/var/lib/hermes-link-server", compose)
         self.assertIn("read_only: true", compose)
         self.assertIn("restart: unless-stopped", compose)
+        exporter = parsed["services"]["model-config-exporter"]
+        self.assertEqual(exporter["network_mode"], "none")
+        self.assertNotIn("env_file", exporter)
+        self.assertEqual(
+            exporter["command"],
+            ["python", "-m", "hermes_link.integrations.hermes_agent.model_config_exporter"],
+        )
+        self.assertEqual(exporter["environment"]["HERMES_LINK_MODEL_CONFIG_UID"], "0")
+        self.assertEqual(exporter["environment"]["HERMES_LINK_MODEL_CONFIG_GID"], "10001")
+        self.assertIn("HERMES_LINK_MODEL_CONFIG_DIR", compose)
 
     def test_public_configuration_defaults_are_generic_and_port_aware(self) -> None:
         environment = (ROOT / "deploy" / "standard" / ".env.example").read_text(encoding="utf-8")
-        self.assertIn("HERMES_LINK_PUBLIC_PORT=443", environment)
-        self.assertIn("HERMES_LINK_PUBLIC_URL=https://hermes.example.com", environment)
-        self.assertNotIn("HERMES_LINK_BRIDGE_PORT", environment)
+        self.assertIn("HERMES_LINK_PUBLIC_PORT=18766", environment)
+        self.assertIn("HERMES_LINK_PUBLIC_URL=http://192.0.2.10:18766", environment)
+        self.assertIn("HERMES_LINK_LISTEN_HOST=0.0.0.0", environment)
+        self.assertIn("HERMES_LINK_LISTEN_PORT=18766", environment)
+        self.assertIn("HERMES_LINK_MOBILE_ENV_FILE=/etc/hermes-link-server/mobile-api.env", environment)
+        self.assertNotIn("HERMES_LINK_CADDY_IMAGE", environment)
+        self.assertNotIn("HERMES_LINK_PROXY_MODE", environment)
         self.assertNotIn("18443", environment)
         self.assertNotIn("24443", environment)
         self.assertNotIn("8765", environment)
@@ -94,11 +114,32 @@ class StandardDeploymentAssetTests(unittest.TestCase):
         for asset_name in release_manifest.RELEASE_DOWNLOAD_ASSET_NAMES.values():
             self.assertIn(asset_name, install)
 
-    def test_caddy_flushes_streams_to_the_selected_loopback_bridge(self) -> None:
-        caddyfile = (ROOT / "deploy" / "standard" / "Caddyfile").read_text(encoding="utf-8")
-        self.assertIn("127.0.0.1:${HERMES_LINK_BRIDGE_PORT}", caddyfile)
-        self.assertIn("flush_interval -1", caddyfile)
-        self.assertIn("/hermes-link/v1/*", caddyfile)
+    def test_standard_runtime_has_no_managed_proxy_or_certificate_assets(self) -> None:
+        compose = (ROOT / "deploy" / "standard" / "compose.yaml").read_text(encoding="utf-8")
+        self.assertNotIn("caddy:", compose)
+        self.assertNotIn("Caddyfile", compose)
+        self.assertNotIn("HERMES_LINK_CADDY_IMAGE", compose)
+
+    def test_install_supports_direct_http_ip_or_domain_endpoint(self) -> None:
+        install = (ROOT / "install.sh").read_text(encoding="utf-8")
+        cli = (ROOT / "deploy" / "standard" / "bin" / "hermes-link").read_text(encoding="utf-8")
+        bootstrap = (ROOT / "scripts" / "bootstrap-hermes-agent-access.sh").read_text(encoding="utf-8")
+        self.assertIn("--host HOST", install)
+        self.assertIn("--public-url URL", install)
+        self.assertIn("--listen-host HOST", install)
+        self.assertIn("--listen-port PORT", install)
+        self.assertIn("HERMES_LINK_LISTEN_PORT=%s", install)
+        self.assertIn("HERMES_LINK_LISTEN_HOST=%s", install)
+        self.assertIn("pull_or_import_server_image", install)
+        self.assertIn('docker pull "$image"', install)
+        self.assertIn("[[ -n \"$reuse_agent_credential\" ]] || return 0", install)
+        self.assertIn("[[ -n \"$state_import_dir\" ]] || return 0", install)
+        self.assertNotIn("Caddy", install)
+        self.assertIn("listen_port()", cli)
+        self.assertIn("HERMES_LINK_LISTEN_PORT", cli)
+        self.assertIn("pair_command()", cli)
+        self.assertIn(".config/hermes-link-server/internal-agent.env", bootstrap)
+        self.assertIn('runuser -u "$agent_user" -- "$python_bin"', bootstrap)
 
     def test_standard_cli_resolves_the_install_root_from_its_bin_directory(self) -> None:
         cli = (ROOT / "deploy" / "standard" / "bin" / "hermes-link").read_text(encoding="utf-8")
@@ -116,7 +157,7 @@ class StandardDeploymentAssetTests(unittest.TestCase):
         self.assertIn("server-identity.json hermes_link_server_identity.json", install)
         self.assertIn("cloud-config.json hermes_link_cloud_config.json", install)
         self.assertIn('"$state_identity_source" "$install_dir/data/server/server-identity.json"', install)
-        self.assertIn("HERMES_LINK_BRIDGE_PORT=%s", install)
+        self.assertIn("HERMES_LINK_LISTEN_PORT=%s", install)
         self.assertIn("chown 10001:10001", install)
         self.assertNotIn("install -d -m 0700 -o 10001", install)
         dockerfile = (ROOT / "deploy" / "docker" / "Dockerfile").read_text(encoding="utf-8")
