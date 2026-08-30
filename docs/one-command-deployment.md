@@ -12,7 +12,7 @@ credential, discovers Profiles, starts the runtime, and renders a short-lived
 pairing QR. It never asks for or prints an upstream Hermes Agent token.
 
 ```bash
-curl -fL https://github.com/yhvspm/hermes-link-server/releases/download/v1.0.2/hermes-link-server-install.sh \
+curl -fL https://github.com/yhvspm/hermes-link-server/releases/download/v1.0.3/hermes-link-server-install.sh \
   -o hermes-link-server-install.sh
 sudo bash hermes-link-server-install.sh \
   --host 192.168.1.10 \

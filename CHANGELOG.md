@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.3 - Multi-architecture release image
+
+- Publish the standard Server image for Linux amd64 and arm64 from the
+  immutable Release workflow.
+- Keep the verified Linux amd64 OCI archive fallback for registry outages.
+
 ## 1.0.2 - Direct HTTP/IP deployment
 
 - Create the dedicated credential as the Agent user for user-scoped systemd

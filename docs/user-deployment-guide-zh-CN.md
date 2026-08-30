@@ -1,6 +1,6 @@
 # Hermes Link Server 用户部署手册
 
-> 适用版本：Hermes Link Server 1.0.2、Hermes Link Protocol v1。
+> 适用版本：Hermes Link Server 1.0.3、Hermes Link Protocol v1。
 > 原则：自托管是基础模式；Cloud 可选；Server 是 App 与 Hermes Agent 的兼容边界。
 
 ## 1. 默认拓扑：直接 HTTP/IP
@@ -36,7 +36,7 @@ IP 地址直接访问 Server；Agent 始终只应监听本机回环地址。
 在已运行 Hermes 的 Ubuntu 主机执行这一条命令：
 
 ```bash
-curl -fsSL https://github.com/yhvspm/hermes-link-server/releases/download/v1.0.2/hermes-link-server-install.sh | \
+curl -fsSL https://github.com/yhvspm/hermes-link-server/releases/download/v1.0.3/hermes-link-server-install.sh | \
   sudo bash -s -- --host 192.168.1.10 --public-port 18766
 ```
 

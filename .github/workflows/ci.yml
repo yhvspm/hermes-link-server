@@ -30,7 +30,7 @@ jobs:
         run: |
           bash -n install.sh
           bash -n deploy/standard/bin/hermes-link
-          bash install.sh --dry-run --source-dir "$PWD" --domain hermes.example.com --public-port 18443 --proxy-mode external --agent-user runner --hermes-home /tmp/runner/.hermes
+          bash install.sh --dry-run --source-dir "$PWD" --host hermes.example.com --public-port 18443 --agent-user runner --hermes-home /tmp/runner/.hermes
       - name: Standard Compose validation
         run: |
           printf 'HERMES_LINK_MOBILE_API_TOKEN=example-internal-credential\n' > .ci-internal-agent.env

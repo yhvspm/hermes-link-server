@@ -11,7 +11,7 @@ state locally, and treats Cloud notifications as optional.
 On a supported Ubuntu host that already runs Hermes Agent and Docker Compose:
 
 ```bash
-curl -fL https://github.com/yhvspm/hermes-link-server/releases/download/v1.0.2/hermes-link-server-install.sh -o hermes-link-server-install.sh
+curl -fL https://github.com/yhvspm/hermes-link-server/releases/download/v1.0.3/hermes-link-server-install.sh -o hermes-link-server-install.sh
 sudo bash hermes-link-server-install.sh
 ```
 
@@ -27,7 +27,7 @@ port directly; it does not install Caddy, issue a certificate, or require TCP
 
 To migrate an existing managed `v1.0.0` installation without changing its
 identity or pairing state, run the same downloaded installer with
-`--upgrade-existing`. It first stages the verified `v1.0.2` update command,
+`--upgrade-existing`. It first stages the verified `v1.0.3` update command,
 then uses the normal backup-and-rollback update flow.
 
 The selected port must be in `1024..65535` because the Server remains an
@@ -36,7 +36,8 @@ separate Caddy or hidden public port.
 
 The current standard installer supports Ubuntu 22.04 and newer, including
 25.10 and 26.04. It checks for Docker Engine with Compose v2 rather than
-installing Docker silently.
+installing Docker silently. The published Server image supports Linux amd64
+and arm64; the verified OCI archive fallback remains amd64-only.
 
 ## Operate
 

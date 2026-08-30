@@ -102,6 +102,8 @@ class StandardDeploymentAssetTests(unittest.TestCase):
         self.assertNotIn("image_repository()", cli)
         self.assertIn("provenance: mode=max", workflow)
         self.assertIn("sbom: true", workflow)
+        self.assertIn("docker/setup-qemu-action@v3", workflow)
+        self.assertIn("platforms: linux/amd64,linux/arm64", workflow)
         self.assertIn("release-manifest.json.sha256", workflow)
         self.assertIn("skopeo copy --all", workflow)
         self.assertIn("verify-image-archive", workflow)

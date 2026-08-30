@@ -34,7 +34,9 @@ jobs:
           python scripts/architecture_gate.py
           python scripts/secret_scan.py
           python scripts/public_release_gate.py
-      - name: Build standard release image
+      - name: Set up multi-architecture emulation
+        uses: docker/setup-qemu-action@v3
+      - name: Build standard multi-architecture release image
         uses: docker/setup-buildx-action@v3
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -55,6 +57,7 @@ jobs:
         with:
           context: .
           file: deploy/docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}

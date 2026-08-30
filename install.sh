@@ -5,7 +5,7 @@ umask 077
 # This is the supported entry point for the standard Docker runtime. It is
 # intentionally independent from the older development/validation Compose
 # assets under deploy/docker.
-DEFAULT_VERSION='1.0.2'
+DEFAULT_VERSION='1.0.3'
 DEFAULT_IMAGE_REPOSITORY='ghcr.io/yhvspm/hermes-link-server'
 DEFAULT_RELEASE_DOWNLOAD_BASE_URL='https://github.com/yhvspm/hermes-link-server/releases/download'
 INSTALL_DIR='/opt/hermes-link'
@@ -14,7 +14,7 @@ MOBILE_CREDENTIAL_FILE='/etc/hermes-link-server/mobile-api.env'
 
 usage() {
   cat <<'EOF'
-Usage: curl -fL https://github.com/yhvspm/hermes-link-server/releases/download/v1.0.2/hermes-link-server-install.sh -o hermes-link-server-install.sh
+Usage: curl -fL https://github.com/yhvspm/hermes-link-server/releases/download/v1.0.3/hermes-link-server-install.sh -o hermes-link-server-install.sh
        sudo bash hermes-link-server-install.sh
 
 Or from a reviewed release tree:
@@ -31,7 +31,7 @@ Options:
   --agent-user USER            Hermes Agent operating-system user
   --hermes-home PATH           Hermes metadata directory
   --image IMAGE                Advanced local-source image override
-  --version VERSION            Pinned release version (default: 1.0.2)
+  --version VERSION            Pinned release version (default: 1.0.3)
   --source-dir PATH            Use local release assets instead of downloading them
   --install-dir PATH           Installation directory (default: /opt/hermes-link)
   --upgrade-existing           Bootstrap a managed installation into this pinned release
